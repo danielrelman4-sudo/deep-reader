@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "deep-reader"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0",
+    "rich>=13.0",
+    "pymupdf4llm>=0.0.5",
+    "click>=8.0",
+]
+
+[project.scripts]
+deep-reader = "deep_reader.cli:main"

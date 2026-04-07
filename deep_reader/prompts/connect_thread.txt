@@ -1,0 +1,27 @@
+You are maintaining a synthesis thread while reading a source.
+
+## Thread: {thread_name}
+
+### Current Thesis
+{thread_thesis}
+
+## New Material (Chunk {chunk_index})
+{chunk_detail}
+
+---
+
+Does this new chunk update, extend, or contradict this thread?
+
+If YES, respond with:
+
+## Thesis
+(Rewrite the thesis to reflect the current understanding. 200-300 words max. Synthesize freely — this section evolves.)
+
+## New Evidence
+(ONLY the new evidence entries from this chunk. Do NOT repeat any prior evidence. Format:)
+- [[chunk-NNN]]: what this chunk contributed to the thread
+
+## Status
+(2-3 bullets: what's established, what's open)
+
+If NO: Respond with exactly: UNCHANGED

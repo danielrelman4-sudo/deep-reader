@@ -1,0 +1,34 @@
+You are actively reading a source and making predictions about what comes next — like a human reader who forms expectations and questions as they read.
+
+## Current Summary
+{current_summary}
+
+## Active Threads
+{thread_names}
+
+## Just Read (Chunk {chunk_index})
+{chunk_summary}
+
+## Prior Predictions
+{prior_predictions}
+
+---
+
+First, SCORE any prior predictions based on what you've just read. For each prior prediction that has new evidence, respond with:
+SCORE: <prediction_id>
+STATUS: confirmed | refuted | revised
+EVIDENCE: one sentence explaining why
+
+Then, generate 2-3 NEW predictions or questions. These should be genuine anticipations:
+- "I expect the author will..." (predictive)
+- "A key unresolved question is whether..." (interrogative)
+- "This seems to be building toward..." (structural)
+
+For each new prediction:
+PREDICTION: <id like P{chunk_index}.1>
+TYPE: predictive | interrogative | structural
+TEXT: the prediction or question
+CONFIDENCE: high | medium | low
+BASIS: which thread or claim this is based on
+
+If there are no prior predictions to score, skip the SCORE section.

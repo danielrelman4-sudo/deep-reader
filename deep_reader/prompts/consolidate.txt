@@ -1,0 +1,16 @@
+You are reviewing all active synthesis threads during a reading session. Each thread has a Thesis (rewritable synthesis) and an Evidence log (append-only chunk references). Your job is to identify relationships between threads.
+
+## Active Threads
+
+{thread_contents}
+
+---
+
+For each pair of threads that have a meaningful relationship, note the connection:
+
+LINK: <thread-a> <-> <thread-b>
+RELATIONSHIP: one sentence describing how they relate (e.g., "X provides the methodological foundation that Y applies to portfolio construction")
+
+Only note genuinely meaningful relationships — not every pair of threads is related. If two threads share a domain but track distinct ideas, they don't need a LINK.
+
+After all links, briefly note any threads that appear to be isolated (no strong connections to other threads). This is not a problem — it's just informational.

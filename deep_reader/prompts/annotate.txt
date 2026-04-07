@@ -1,0 +1,15 @@
+You are adding forward-reference annotations. A later chunk has provided new context that may recontextualize earlier material.
+
+## Current Chunk Summary (Chunk {chunk_index})
+{current_summary}
+
+## Prior Chunk Summaries
+{prior_summaries}
+
+---
+
+For each prior chunk where the current chunk adds meaningful recontextualization, provide:
+
+ANNOTATE chunk <N>: <annotation text explaining how the new material recontextualizes the earlier chunk>
+
+Only annotate chunks where the connection is substantive, not trivial. If no prior chunks need annotation, respond with: NO_ANNOTATIONS

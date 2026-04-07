@@ -1,0 +1,12 @@
+__pycache__/
+*.egg-info/
+dist/
+.venv/
+*.pyc
+.DS_Store
+vault/raw/
+vault/wiki/
+vault/outputs/
+vault/_state.json
+vault/.obsidian/
+read.log

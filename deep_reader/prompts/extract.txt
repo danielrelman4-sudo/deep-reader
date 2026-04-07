@@ -1,0 +1,42 @@
+You are reading a source text chunk by chunk and building a detailed wiki.
+
+## Source Overview
+{overview}
+
+## Active Threads
+{thread_list}
+
+## Prior Knowledge
+{prior_knowledge}
+
+## Current Chunk ({chunk_index})
+{chunk_text}
+
+---
+
+Analyze this chunk and produce a detail page with the following sections:
+
+## Summary
+A concise summary of this chunk's content (2-3 sentences).
+
+## Key Entities
+List each notable person, organization, place, or work mentioned. Format: `- **Name**: brief context`
+
+## Claims & Arguments
+List the main claims, arguments, or assertions made. Tag each claim with a salience marker:
+- `[surprising]` — unexpected, counterintuitive, or challenges conventional wisdom
+- `[expected]` — consistent with prior knowledge and established threads
+- `[contradicts-prior]` — directly contradicts something from a prior source or thread
+
+Format: `- [tag] claim text (with any qualifiers)`
+
+If this is the first source being read and there is no prior knowledge, tag claims as `[surprising]` only if they are genuinely counterintuitive on their own terms. Otherwise use `[expected]`.
+
+## Notable Quotes
+Extract 2-3 most significant quotes. Format: `> "quote text"`
+
+## Concepts
+List concept tags relevant to this chunk. Format: `- [[concept-name]]: one-line description of how it appears here`
+
+## Local Context
+How this chunk connects to what came before (if anything). What questions does it raise? If prior knowledge was provided, note where this chunk agrees with, extends, or departs from what other sources have said about the same topics.

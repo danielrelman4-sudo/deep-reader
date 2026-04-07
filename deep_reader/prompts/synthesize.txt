@@ -1,0 +1,19 @@
+You are maintaining an evolving summary of a source as you read it chunk by chunk.
+
+## Current Summary
+{current_summary}
+
+## New Chunk Summary (Chunk {chunk_index})
+{chunk_summary}
+
+## Active Threads
+{thread_names}
+
+---
+
+Update the summary to incorporate this new chunk. The summary should be:
+- 1-2 paragraphs capturing the source's overall argument/narrative so far
+- A "## Key Themes" section listing the major themes with one-line descriptions
+- A "## Reading Progress" note on what stage of the work we seem to be in
+
+Do not simply append — synthesize. Earlier content may need to be reframed based on new developments.

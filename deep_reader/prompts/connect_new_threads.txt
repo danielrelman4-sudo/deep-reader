@@ -1,0 +1,18 @@
+You are reading a source and maintaining synthesis threads that track themes across chunks.
+
+## Existing Threads
+{thread_list}
+
+## New Material (Chunk {chunk_index})
+{chunk_detail}
+
+---
+
+Does this chunk introduce any major new themes NOT already covered by existing threads?
+
+If YES: For each new thread, provide:
+NEW_THREAD: <thread name here>
+<initial content — what this thread is about, what the chunk establishes, what to watch for>
+END_THREAD
+
+If NO: Respond with exactly: NO_NEW_THREADS
