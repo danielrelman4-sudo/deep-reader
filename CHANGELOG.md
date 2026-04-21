@@ -31,6 +31,11 @@ Redesigned for a cross-functional operator as the primary user. Original book-re
 - `GlobalState` additions are all optional fields → existing `_state.json` loads unchanged
 - `migrate` command still backfills pre-v1.1 PREDICT step
 
+### Granola automation
+- MCP prompts (saved workflows) for one-click Granola integration: `ingest_granola_today`, `ingest_granola_week`, `ingest_granola_range(start, end)`, plus `catch_me_up`
+- These assume Granola's own MCP server (launched Feb 2026) is registered alongside this one in Claude Desktop — Claude orchestrates across both
+- `deep-reader watch` — polling inbox watcher. Safely ignores half-written files via mtime stability check. Supports `--once` for cron/launchd scheduling.
+
 ### Deferred to later
 - Image/OCR ingest
 - Automated Granola/Notion/Linear sync (manual inbox drop for now)

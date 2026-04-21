@@ -671,6 +671,25 @@ def mcp(ctx):
     server.run()
 
 
+@main.command()
+@click.option("--interval", default=5.0, help="Poll interval in seconds")
+@click.option("--once", is_flag=True, help="Run one pass and exit (good for cron)")
+@click.pass_context
+def watch(ctx, interval, once):
+    """Watch vault/inbox/ and auto-ingest files dropped into it.
+
+    Runs a simple polling loop. A file is only ingested after two consecutive
+    polls see the same size + mtime — this avoids picking up files that are
+    still being copied in.
+
+    Use --once for a single scan (suitable for launchd / cron).
+    """
+    from deep_reader.watcher import watch as _watch
+    config = ctx.obj["config"]
+    config.ensure_dirs()
+    _watch(config, interval=interval, once=once)
+
+
 @main.command(name="recap-prep")
 @click.option("--date", "target_date", default=None, help="Target date (YYYY-MM-DD); default today")
 @click.pass_context

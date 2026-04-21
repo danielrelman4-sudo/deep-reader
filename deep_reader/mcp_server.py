@@ -391,6 +391,85 @@ def build_server(vault_root: Path):
         added = run_sync_recap(config, td)
         return {"added": added}
 
+    # ---------- Prompts ----------
+    #
+    # Prompts are saved workflows surfaced by Claude Desktop as one-click
+    # options. They orchestrate calls across MCP servers — the Granola ones
+    # assume the user has also registered Granola's MCP server alongside this
+    # one.
+
+    @mcp.prompt(
+        description=(
+            "Fetch all of today's meetings from Granola and ingest each into "
+            "the knowledge base. Requires the Granola MCP server to also be "
+            "registered in Claude Desktop."
+        ),
+    )
+    def ingest_granola_today() -> str:
+        return (
+            "Use the Granola MCP tools to list every meeting from today, then "
+            "for each meeting call this server's `ingest_meeting` tool with "
+            "the meeting's full content, title, date, and attendee list. "
+            "After ingesting, summarize what you added: how many meetings, "
+            "who was in them, and any new action items that ended up on my "
+            "list. If Granola doesn't return anything for today, say so "
+            "rather than inventing meetings."
+        )
+
+    @mcp.prompt(
+        description=(
+            "Fetch meetings from Granola for a given date range and ingest "
+            "each. Args: start_date and end_date as YYYY-MM-DD. Requires the "
+            "Granola MCP server to also be registered in Claude Desktop."
+        ),
+    )
+    def ingest_granola_range(start_date: str, end_date: str) -> str:
+        return (
+            f"Use the Granola MCP tools to list every meeting between "
+            f"{start_date} and {end_date} (inclusive). For each meeting, "
+            f"call this server's `ingest_meeting` tool with the meeting's "
+            f"full content, title, date, and attendee list. Skip any meeting "
+            f"that appears to already be in the vault (check via `search` "
+            f"first if unsure). After ingesting, summarize: how many were "
+            f"added, who's been most active in that range, and the top new "
+            f"action items that landed on my list."
+        )
+
+    @mcp.prompt(
+        description=(
+            "Fetch the last 7 days of Granola meetings and ingest any not "
+            "already present. Good for a weekly catchup."
+        ),
+    )
+    def ingest_granola_week() -> str:
+        return (
+            "Use the Granola MCP tools to list every meeting from the past 7 "
+            "days (today minus 6, through today). For each meeting, check "
+            "whether we already have it — call this server's `search` tool "
+            "with the meeting title first. If not found, call `ingest_meeting` "
+            "with the meeting content, title, date, and attendees. At the end, "
+            "give me a short weekly recap: who I met with, recurring themes "
+            "you noticed across meetings, new people added to the vault, and "
+            "any follow-ups that need my attention."
+        )
+
+    @mcp.prompt(
+        description=(
+            "Catch me up — summarize what's changed in my vault since we last "
+            "talked: open action items, new people, recent meetings."
+        ),
+    )
+    def catch_me_up() -> str:
+        return (
+            "Read the `vault://summary` resource and the `vault://action_items` "
+            "resource. Call `list_action_items(status='open')` and "
+            "`list_waiting_on(status='open')`. Give me a concise brief "
+            "(no more than ~200 words) covering: my top open action items "
+            "ranked by how old they are, anything I'm waiting on that's been "
+            "sitting too long, the most recent 3-5 sources in the vault, "
+            "and one thing you think I should do next."
+        )
+
     return mcp
 
 

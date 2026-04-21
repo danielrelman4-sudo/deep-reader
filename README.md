@@ -105,6 +105,71 @@ Ask Claude things like:
 
 `vault://summary` · `vault://action_items` · `vault://waiting_on` · `vault://people` · `vault://people/{slug}` · `vault://sources/{slug}` · `vault://threads/{name}` · `vault://recaps/{date}` · `vault://inbox`
 
+### Available prompts (one-click workflows)
+
+Claude Desktop surfaces MCP prompts as saved workflows:
+
+| Prompt | What it does |
+|---|---|
+| `ingest_granola_today` | Pulls today's meetings from Granola MCP and ingests each one |
+| `ingest_granola_week` | Last 7 days; skips anything already in the vault |
+| `ingest_granola_range(start, end)` | Arbitrary date range |
+| `catch_me_up` | Reads state and returns a concise brief of open items + recent activity |
+
+The `ingest_granola_*` prompts require Granola's own MCP server to be registered alongside this one (see "Granola integration" below).
+
+## Granola integration
+
+Granola shipped an MCP server in Feb 2026. The cleanest automation is to register both MCP servers in Claude Desktop and let Claude orchestrate — no polling, no API keys, no launchd jobs.
+
+In `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "deep-reader": { "command": "...", "args": ["..."] },
+    "granola": {
+      "command": "npx",
+      "args": ["-y", "@granola/mcp"]
+    }
+  }
+}
+```
+
+(Check Granola's docs for the current MCP install command — the one above is a likely default but their canonical command lives at their integrations page.)
+
+Then in Claude Desktop, invoke the saved prompt `ingest_granola_today` — Claude calls Granola's MCP to fetch meetings and this server's `ingest_meeting` for each.
+
+## Inbox watcher
+
+For non-Granola sources (PDFs you download, docs exported from Notion, etc.), drop files in `vault/inbox/` and run the watcher:
+
+```bash
+deep-reader --vault vault watch              # foreground loop, Ctrl-C to stop
+deep-reader --vault vault watch --once       # single scan, good for cron/launchd
+deep-reader --vault vault watch --interval 30
+```
+
+The watcher polls every few seconds and only ingests a file once its size + mtime have been stable for one poll — so a file still being copied in won't get picked up half-written.
+
+Scheduling a periodic `watch --once` via launchd is a reasonable middle ground if you don't want a long-running process:
+
+```xml
+<!-- ~/Library/LaunchAgents/com.deep-reader.watch.plist -->
+<plist version="1.0">
+  <dict>
+    <key>Label</key><string>com.deep-reader.watch</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/path/to/.venv/bin/deep-reader</string>
+      <string>--vault</string><string>/path/to/vault</string>
+      <string>watch</string><string>--once</string>
+    </array>
+    <key>StartInterval</key><integer>300</integer>
+  </dict>
+</plist>
+```
+
 ### Troubleshooting MCP
 
 - **Tools don't appear in Claude Desktop** — Verify the `command` path in your config file exists and is executable: `ls -la /absolute/path/to/deep-reader/.venv/bin/deep-reader`. Quit Claude Desktop fully and relaunch.
