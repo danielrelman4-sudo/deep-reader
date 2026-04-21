@@ -122,11 +122,8 @@ def _do_ingest(ctx, source_file, source_type, title, author, meeting_date=None, 
 
 
 def _slug(text: str) -> str:
-    import re as _re
-    s = text.lower().strip()
-    s = _re.sub(r"[^a-z0-9\s-]", "", s)
-    s = _re.sub(r"\s+", "-", s)
-    return _re.sub(r"-+", "-", s).strip("-")[:60]
+    from deep_reader.markdown import slugify
+    return slugify(text)
 
 
 def _extract_docx(path: Path) -> str:

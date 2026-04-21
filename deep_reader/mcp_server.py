@@ -991,11 +991,10 @@ def _dump_action(a, state: GlobalState | None = None) -> dict:
 
 
 def _slugify(text: str) -> str:
-    import re
-    s = text.lower().strip()
-    s = re.sub(r"[^a-z0-9\s-]", "", s)
-    s = re.sub(r"\s+", "-", s)
-    return re.sub(r"-+", "-", s).strip("-")[:60]
+    # Delegate to the hardened canonical slugify — handles em-dashes, curly
+    # quotes, escape-sequence residue (e.g. literal "\u2014" sneaking in).
+    from deep_reader.markdown import slugify
+    return slugify(text)
 
 
 def _auto_detect_type_path(path: Path) -> str:

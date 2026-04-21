@@ -270,8 +270,5 @@ def _parse_new_threads(text: str) -> list[dict]:
 
 
 def _slugify(text: str) -> str:
-    s = text.lower().strip()
-    s = re.sub(r"[^a-z0-9\s-]", "", s)
-    s = re.sub(r"\s+", "-", s)
-    s = re.sub(r"-+", "-", s).strip("-")
-    return s
+    from deep_reader.markdown import slugify
+    return slugify(text)

@@ -30,13 +30,36 @@ def extract_wiki_links(text: str) -> list[str]:
     return re.findall(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]", text)
 
 
-def slugify(text: str) -> str:
-    """Convert text to a URL/file-safe slug."""
-    slug = text.lower().strip()
-    slug = re.sub(r"[^a-z0-9\s-]", "", slug)
-    slug = re.sub(r"[\s]+", "-", slug)
-    slug = re.sub(r"-+", "-", slug).strip("-")
-    return slug
+def slugify(text: str, max_len: int = 60) -> str:
+    """Convert text to a URL/file-safe slug.
+
+    Handles three gotchas we've seen in production:
+      1. Typographic dashes and quotes (em-dash, en-dash, curly quotes) get
+         mapped to ASCII equivalents before stripping — otherwise they were
+         silently dropped and words ran together.
+      2. Literal Python escape-sequence strings like `\\u2014` (which some
+         clients emit instead of the actual character) get stripped, not
+         preserved as "u2014" in the slug.
+      3. Length capped to a sensible default so filesystem paths stay manageable.
+    """
+    # Strip escape-sequence residue like \u2014 or \x20 before anything else
+    s = re.sub(r"\\[uUxX][0-9a-fA-F]{2,8}", " ", text)
+    # Normalize common typographic characters to ASCII
+    replacements = {
+        "—": "-", "–": "-", "−": "-",            # dashes
+        "\u2018": "'", "\u2019": "'",            # curly single quotes
+        "\u201C": '"', "\u201D": '"',            # curly double quotes
+        "…": "...", "•": "-", "·": "-",
+    }
+    for src, dst in replacements.items():
+        s = s.replace(src, dst)
+    s = s.lower().strip()
+    s = re.sub(r"[^a-z0-9\s-]", "", s)
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    if max_len and len(s) > max_len:
+        s = s[:max_len].rstrip("-")
+    return s
 
 
 def format_frontmatter(metadata: dict) -> str:
