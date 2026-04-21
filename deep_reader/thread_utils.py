@@ -46,17 +46,18 @@ def append_evidence(existing_evidence: str, new_entries: str) -> str:
         return new_entries
 
     # Deduplicate: don't add entries for chunks already in evidence
-    existing_chunks = set()
+    # Handles both [[chunk-NNN]] and [[source-slug/chunk-NNN]] formats
+    import re
+    existing_refs = set()
     for line in existing_evidence.split("\n"):
-        import re
-        m = re.search(r"\[\[chunk-(\d+)\]\]", line)
+        m = re.search(r"\[\[([^\]]*chunk-\d+)\]\]", line)
         if m:
-            existing_chunks.add(m.group(1))
+            existing_refs.add(m.group(1))
 
     new_lines = []
     for line in new_entries.split("\n"):
-        m = re.search(r"\[\[chunk-(\d+)\]\]", line)
-        if m and m.group(1) in existing_chunks:
+        m = re.search(r"\[\[([^\]]*chunk-\d+)\]\]", line)
+        if m and m.group(1) in existing_refs:
             continue  # skip duplicate
         if line.strip():
             new_lines.append(line)

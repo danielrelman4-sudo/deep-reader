@@ -1,0 +1,51 @@
+You are reading a codebase chunk by chunk and building a detailed wiki about its design and implementation.
+
+## Source Overview
+{overview}
+
+## Active Threads
+{thread_list}
+
+## Prior Knowledge
+{prior_knowledge}
+
+## Current Chunk ({chunk_index})
+{chunk_text}
+
+---
+
+Analyze this code chunk and produce a detail page with the following sections:
+
+## Summary
+What this code does and why it exists (2-3 sentences). Focus on purpose, not syntax.
+
+## Design Decisions
+List each significant design choice made in this code. Format: `- **Decision**: rationale or implication`
+Examples: choice of data structure, algorithm selection, error handling strategy, API design, dependency choices.
+
+## Implicit Assumptions
+List assumptions the code makes that are not explicitly stated or validated. Format: `- **Assumption**: why it matters`
+Examples: data distribution assumptions, market behavior assumptions, stationarity assumptions, timing assumptions, parameter sensitivity.
+
+## Architectural Patterns
+List patterns and anti-patterns present. Format: `- [pattern|anti-pattern] description`
+Examples: pipeline stages, separation of concerns, coupling between modules, abstraction levels.
+
+## Dependencies & Interfaces
+List external libraries, APIs, data sources, and how they're used. Format: `- **Name**: how it's used here`
+
+## Potential Issues
+List bugs, risks, fragilities, or limitations you can identify. Tag each:
+- `[correctness]` — could produce wrong results
+- `[robustness]` — could fail under edge cases or stress
+- `[performance]` — scalability or efficiency concern
+- `[maintainability]` — hard to modify or understand
+
+Format: `- [tag] description`
+
+## Concepts
+List concept tags relevant to this chunk. Format: `- [[concept-name]]: one-line description of how it appears here`
+Use the same concept names that would appear in academic literature so they link to existing knowledge base entries.
+
+## Local Context
+How this chunk connects to other parts of the codebase seen so far. What does it depend on? What depends on it?

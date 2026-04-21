@@ -1,4 +1,4 @@
-You are maintaining an evolving summary of a source as you read it chunk by chunk.
+You are maintaining an evolving summary of a source as you read it chunk by chunk. This summary is the connective tissue of the entire knowledge base — it should reveal how ideas relate, where tensions exist, and what the source actually argues (not just what it covers).
 
 ## Current Summary
 {current_summary}
@@ -11,9 +11,21 @@ You are maintaining an evolving summary of a source as you read it chunk by chun
 
 ---
 
-Update the summary to incorporate this new chunk. The summary should be:
-- 1-2 paragraphs capturing the source's overall argument/narrative so far
-- A "## Key Themes" section listing the major themes with one-line descriptions
-- A "## Reading Progress" note on what stage of the work we seem to be in
+Rewrite the summary to incorporate this new chunk. Do not simply append or list topics — synthesize.
 
-Do not simply append — synthesize. Earlier content may need to be reframed based on new developments.
+## Structure
+
+### Argument Arc
+Trace the source's actual argument as it has developed so far — as long as it needs to be to do justice to the material. Write this like an opinionated review, not a table of contents. What is the author *really* saying? What is the logical structure connecting the parts? Where does the argument succeed and where does it strain? If the author makes moves that are surprising, contradictory, or unusually strong, call them out. For a dense or multi-part work, this may be many paragraphs — that's fine. Don't compress for brevity; compress for clarity.
+
+### Tensions & Open Questions
+Bullet list of unresolved tensions, contradictions, or questions the source has raised but not yet settled. Remove items that have been resolved by new material. These should be genuine intellectual tensions, not just "topic X hasn't been covered yet."
+
+### Thread Connections
+For each active thread, one sentence on how the current state of the source relates to that thread. Focus on *what changed* with recent material — don't repeat stable descriptions. If a thread hasn't been affected by recent chunks, omit it.
+
+## Guidelines
+- Be opinionated. "The author argues X, which is compelling because Y" or "This claim is undercut by Z" — not "The source discusses X."
+- Reframe earlier content when new material changes its meaning. The summary should read as if written by someone who has read everything so far, not someone who read it incrementally.
+- Keep it tight. The argument arc should be dense and precise, not exhaustive.
+- Do not list every topic or theme. Capture the 3-5 load-bearing ideas that structure the whole work.

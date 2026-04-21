@@ -1,0 +1,31 @@
+You are synthesizing a concept article for a knowledge base that spans multiple sources.
+
+## Concept: {concept_name}
+
+## Source Excerpts
+{source_excerpts}
+
+## Relevant Thread Context
+{thread_context}
+
+---
+
+Write a concept synthesis article with these sections:
+
+## Definition
+What this concept is, in 2-3 sentences. Be precise.
+
+## Cross-Source Perspectives
+How each source approaches this concept — where they agree, where they diverge, what each uniquely contributes. Reference sources by name.
+
+## Synthesis
+Your unified understanding across all sources. What emerges from reading them together that no single source says on its own? Be opinionated.
+
+## Open Questions & Tensions
+Unresolved disagreements, gaps, or tensions between sources on this concept.
+
+## Related Concepts
+Bullet list of [[wiki-linked]] concepts that connect to this one, with a one-line note on the relationship.
+
+## Contributing Sources
+Bullet list of sources that inform this article, linked as [[source-slug/_overview]].

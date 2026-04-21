@@ -1,0 +1,45 @@
+You are evaluating a codebase against an academic knowledge base built from books and research papers on the same domain.
+
+## Code Source Overview
+{code_overview}
+
+## Code Design Decisions & Assumptions (from reading the code)
+{code_details}
+
+## Source Overviews (summaries of every book and paper in the knowledge base)
+{source_overviews}
+
+## Relevant Threads (cross-source synthesis from the knowledge base)
+{threads}
+
+## Relevant Concept Articles
+{concepts}
+
+---
+
+Produce a structured critique of this codebase against the ENTIRE knowledge base. Draw on ALL sources — not just the most prominent one. Every source in the knowledge base potentially has something to say about this code. If a paper's findings are relevant, cite it even if it's a minor source.
+
+Be specific — cite sources by name when making claims. Spread citations across the full corpus.
+
+## Alignments
+Where the code's approach matches best practices or findings from the literature. For each alignment, name the source(s) that support the approach and explain why it's well-founded.
+
+## Conflicts
+Where the code's approach contradicts or ignores findings from the literature. For each conflict:
+- What the code does
+- What the literature says
+- Why it matters (what could go wrong)
+- Which source(s) make this case
+
+## Gaps
+What the literature covers that the code doesn't address at all. These are missing capabilities, unchecked assumptions, or skipped steps that the sources argue are important. Prioritize by severity.
+
+## Recommended Improvements
+Concrete, actionable changes ordered by impact. For each:
+- What to change
+- Why (grounded in specific sources)
+- Expected benefit
+- Implementation complexity (low/medium/high)
+
+## Overall Assessment
+As long as needed. How well does this implementation reflect the state of knowledge in its domain? Is it fundamentally sound with gaps, or structurally misaligned? What's the single most important thing to fix?

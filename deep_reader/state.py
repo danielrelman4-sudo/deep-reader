@@ -44,6 +44,14 @@ class SourceState(BaseModel):
     consolidation_interval: int = 10
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    # Cached chunk summaries, keyed by chunk index. Populated during EXTRACT.
+    # Used by ANNOTATE to avoid re-reading every prior chunk page each iteration.
+    chunk_summaries: Dict[int, str] = Field(default_factory=dict)
+    # Source type, persisted so resume works without re-detection.
+    source_type: str = "book"
+    # Meeting-specific fields (only populated for MEETING sources).
+    meeting_date: Optional[str] = None
+    attendees: List[str] = Field(default_factory=list)
 
     @property
     def is_complete(self) -> bool:
@@ -64,11 +72,62 @@ class SourceState(BaseModel):
         return chunks_since >= self.consolidation_interval
 
 
+class VaultOwner(BaseModel):
+    """Vault owner identity — used to distinguish 'my action items' from 'waiting on'."""
+    name: str = ""
+    email: str = ""
+    aliases: List[str] = Field(default_factory=list)
+
+    def matches(self, candidate: str) -> bool:
+        """Check if a name/email/alias refers to the vault owner."""
+        if not candidate:
+            return False
+        c = candidate.strip().lower()
+        if self.name and c == self.name.lower():
+            return True
+        if self.email and c == self.email.lower():
+            return True
+        for alias in self.aliases:
+            if c == alias.lower():
+                return True
+        return False
+
+
+class Person(BaseModel):
+    """A person referenced across the knowledge base."""
+    slug: str
+    name: str
+    email: Optional[str] = None
+    aliases: List[str] = Field(default_factory=list)
+    appearances: List[str] = Field(default_factory=list)  # source slugs
+    first_seen: Optional[datetime] = None
+    last_seen: Optional[datetime] = None
+    summary: str = ""
+    role: str = ""
+    # Appearances since last summary regeneration; triggers regen at threshold.
+    new_appearances_since_summary: int = 0
+
+
+class ActionItem(BaseModel):
+    """An action item extracted from a source."""
+    id: str                           # content hash + source + owner
+    description: str
+    owner: str                        # person slug (always set; use 'unassigned' if truly unknown)
+    source: str                       # source slug
+    created_at: datetime
+    status: str = "open"              # open | done | dropped
+    category: str = "mine"            # mine | waiting_on | other
+    completed_at: Optional[datetime] = None
+
+
 class GlobalState(BaseModel):
     """Top-level state saved to _state.json."""
     sources: Dict[str, SourceState] = Field(default_factory=dict)
     global_threads: List[str] = Field(default_factory=list)
     last_updated: Optional[datetime] = None
+    people: Dict[str, Person] = Field(default_factory=dict)
+    action_items: List[ActionItem] = Field(default_factory=list)
+    owner: VaultOwner = Field(default_factory=VaultOwner)
 
     def save(self, path: Path) -> None:
         path.write_text(self.model_dump_json(indent=2))
@@ -76,8 +135,23 @@ class GlobalState(BaseModel):
     @classmethod
     def load(cls, path: Path) -> "GlobalState":
         if path.exists():
-            return cls.model_validate_json(path.read_text())
-        return cls()
+            state = cls.model_validate_json(path.read_text())
+        else:
+            state = cls()
+        # Hydrate owner from _config.json when present (authoritative source).
+        config_path = path.parent / "_config.json"
+        if config_path.exists():
+            try:
+                import json as _json
+                data = _json.loads(config_path.read_text())
+                state.owner = VaultOwner(
+                    name=data.get("name", ""),
+                    email=data.get("email", ""),
+                    aliases=data.get("aliases", []),
+                )
+            except Exception:
+                pass
+        return state
 
     def mark_step_complete(
         self, source_slug: str, chunk_index: int, step: StepName, **kwargs

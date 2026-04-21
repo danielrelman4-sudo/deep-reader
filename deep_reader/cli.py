@@ -19,14 +19,23 @@ def main(ctx, vault):
     ctx.obj["config"] = get_config(Path(vault))
 
 
-@main.command()
-@click.argument("source_file", type=click.Path(exists=True))
-@click.option("--type", "source_type", type=click.Choice(["book", "article", "paper"]), default="book")
-@click.option("--title", default=None, help="Override title (otherwise parsed from filename)")
-@click.option("--author", default=None, help="Override author (otherwise parsed from filename)")
-@click.pass_context
-def ingest(ctx, source_file, source_type, title, author):
-    """Ingest a source file into the vault."""
+@main.group()
+def ingest():
+    """Ingest a source into the vault.
+
+    Use one of the subcommands:
+      ingest book <file>      long-form book (full read loop)
+      ingest paper <file>     academic paper (full read loop)
+      ingest article <file>   article (size-gated)
+      ingest doc <file>       internal doc (size-gated)
+      ingest meeting <file>   meeting note (fast path, extracts attendees + actions)
+      ingest note <file>      short note (fast path)
+      ingest code <dir>       codebase (parallel extract)
+      ingest inbox            process every file in vault/inbox/
+    """
+
+
+def _do_ingest(ctx, source_file, source_type, title, author, meeting_date=None, attendees=None):
     from deep_reader.sources.base import Source, SourceType
     from deep_reader.sources.text import extract_text
     from deep_reader.sources.pdf import extract_pdf
@@ -35,31 +44,208 @@ def ingest(ctx, source_file, source_type, title, author):
     config.ensure_dirs()
     path = Path(source_file)
 
-    # Parse title/author from filename if not provided
-    if not title or not author:
-        stem = path.stem
-        if " - " in stem:
-            parts = stem.split(" - ", 1)
-            title = title or parts[1]
-            author = author or parts[0]
-        else:
-            title = title or stem
-            author = author or "Unknown"
+    if source_type == "code":
+        from deep_reader.sources.code import extract_codebase
+        if not path.is_dir():
+            console.print("[red]Code source must be a directory[/red]")
+            return
+        text = extract_codebase(path)
+        title = title or path.name
+        author = author or "codebase"
+        dest_dir = config.raw_books
+        dest = dest_dir / f"{author} - {title}.md"
+        dest.write_text(text, encoding="utf-8")
+        console.print(f"[green]✓[/green] Ingested codebase: {dest.name} ({len(text.split()):,} words)")
+        return
 
-    # Extract text
+    # Extract text based on file type
     if path.suffix.lower() == ".pdf":
         text = extract_pdf(path)
+    elif path.suffix.lower() == ".docx":
+        text = _extract_docx(path)
     else:
         text = extract_text(path)
 
-    # Determine destination
-    type_dirs = {"book": config.raw_books, "article": config.raw_articles, "paper": config.raw_papers}
-    dest_dir = type_dirs[source_type]
-    last_name = author.split()[-1] if author.split() else "Unknown"
-    dest = dest_dir / f"{last_name} - {title}.md"
-    dest.write_text(text, encoding="utf-8")
+    # Meeting-specific parsing
+    if source_type == "meeting":
+        from deep_reader.sources.meeting import parse_meeting
+        meta = parse_meeting(text, filename=path.name)
+        title = title or meta.title
+        if meeting_date is None:
+            meeting_date = meta.meeting_date.isoformat() if meta.meeting_date else None
+        if attendees is None:
+            attendees = meta.attendees
+        author = author or "meeting"
+    else:
+        # Parse title/author from filename
+        stem = path.stem
+        if " - " in stem and not title and not author:
+            parts = stem.split(" - ", 1)
+            title = parts[1]
+            author = parts[0]
+        else:
+            title = title or stem
+            author = author or {"doc": "doc", "note": "note"}.get(source_type, "Unknown")
 
-    console.print(f"[green]✓[/green] Ingested: {dest.name} ({len(text.split()):,} words)")
+    # Determine destination
+    type_dirs = {
+        "book": config.raw_books,
+        "article": config.raw_articles,
+        "paper": config.raw_papers,
+        "meeting": config.raw_meetings,
+        "doc": config.raw_docs,
+        "note": config.raw_notes,
+    }
+    dest_dir = type_dirs[source_type]
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stable destination filename
+    if source_type == "meeting" and meeting_date:
+        dest = dest_dir / f"{meeting_date}-{_slug(title)}.md"
+    else:
+        last_name = author.split()[-1] if author.split() else "Unknown"
+        dest = dest_dir / f"{last_name} - {title}.md"
+
+    # Embed parsed metadata as frontmatter so downstream passes pick it up.
+    from deep_reader.markdown import format_frontmatter
+    fm: dict = {"title": title, "type": source_type}
+    if meeting_date:
+        fm["date"] = meeting_date
+    if attendees:
+        fm["attendees"] = attendees
+    dest.write_text(format_frontmatter(fm) + text, encoding="utf-8")
+
+    console.print(
+        f"[green]✓[/green] Ingested {source_type}: {dest.name} "
+        f"({len(text.split()):,} words)"
+    )
+
+
+def _slug(text: str) -> str:
+    import re as _re
+    s = text.lower().strip()
+    s = _re.sub(r"[^a-z0-9\s-]", "", s)
+    s = _re.sub(r"\s+", "-", s)
+    return _re.sub(r"-+", "-", s).strip("-")[:60]
+
+
+def _extract_docx(path: Path) -> str:
+    try:
+        import docx  # python-docx
+    except ImportError:
+        raise click.ClickException(
+            "python-docx is required to ingest .docx files. Run: pip install python-docx"
+        )
+    doc = docx.Document(str(path))
+    return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+
+@ingest.command("book")
+@click.argument("source_file", type=click.Path(exists=True))
+@click.option("--title", default=None)
+@click.option("--author", default=None)
+@click.pass_context
+def ingest_book(ctx, source_file, title, author):
+    _do_ingest(ctx, source_file, "book", title, author)
+
+
+@ingest.command("paper")
+@click.argument("source_file", type=click.Path(exists=True))
+@click.option("--title", default=None)
+@click.option("--author", default=None)
+@click.pass_context
+def ingest_paper(ctx, source_file, title, author):
+    _do_ingest(ctx, source_file, "paper", title, author)
+
+
+@ingest.command("article")
+@click.argument("source_file", type=click.Path(exists=True))
+@click.option("--title", default=None)
+@click.option("--author", default=None)
+@click.pass_context
+def ingest_article(ctx, source_file, title, author):
+    _do_ingest(ctx, source_file, "article", title, author)
+
+
+@ingest.command("code")
+@click.argument("source_dir", type=click.Path(exists=True, file_okay=False))
+@click.option("--title", default=None)
+@click.pass_context
+def ingest_code(ctx, source_dir, title):
+    _do_ingest(ctx, source_dir, "code", title, None)
+
+
+@ingest.command("meeting")
+@click.argument("source_file", type=click.Path(exists=True))
+@click.option("--date", "meeting_date", default=None, help="Meeting date (YYYY-MM-DD)")
+@click.option("--title", default=None)
+@click.option("--attendees", default=None, help="Comma-separated override list")
+@click.pass_context
+def ingest_meeting(ctx, source_file, meeting_date, title, attendees):
+    """Ingest a meeting note (Granola-style export or similar)."""
+    attendee_list = [a.strip() for a in attendees.split(",")] if attendees else None
+    _do_ingest(
+        ctx, source_file, "meeting", title, None,
+        meeting_date=meeting_date, attendees=attendee_list,
+    )
+
+
+@ingest.command("doc")
+@click.argument("source_file", type=click.Path(exists=True))
+@click.option("--title", default=None)
+@click.pass_context
+def ingest_doc(ctx, source_file, title):
+    """Ingest an internal doc (one-pager, strategy doc, competitive brief)."""
+    _do_ingest(ctx, source_file, "doc", title, None)
+
+
+@ingest.command("note")
+@click.argument("source_file", type=click.Path(exists=True))
+@click.option("--title", default=None)
+@click.pass_context
+def ingest_note(ctx, source_file, title):
+    """Ingest a short miscellaneous note."""
+    _do_ingest(ctx, source_file, "note", title, None)
+
+
+@ingest.command("inbox")
+@click.pass_context
+def ingest_inbox(ctx):
+    """Ingest every file in vault/inbox/ — auto-detect type from name/content."""
+    config = ctx.obj["config"]
+    config.ensure_dirs()
+    files = sorted([
+        p for p in config.inbox.iterdir()
+        if p.is_file() and p.suffix.lower() in {".md", ".txt", ".pdf", ".docx", ".rtf"}
+    ])
+    if not files:
+        console.print("[dim]Inbox is empty.[/dim]")
+        return
+    for f in files:
+        stype = _auto_detect_type(f)
+        console.print(f"[cyan]→[/cyan] {f.name} ({stype})")
+        _do_ingest(ctx, str(f), stype, None, None)
+
+
+def _auto_detect_type(path: Path) -> str:
+    """Heuristically pick a source type for a file in the inbox."""
+    import re as _re
+    name = path.name.lower()
+    # YYYY-MM-DD prefix → meeting
+    if _re.match(r"^\d{4}-\d{2}-\d{2}[-_\s]", name):
+        return "meeting"
+    # common meeting keywords
+    if any(k in name for k in ["meeting", "1-1", "11", "standup", "sync", "call"]):
+        return "meeting"
+    # short files → note
+    try:
+        if path.suffix.lower() in {".md", ".txt"}:
+            size = path.stat().st_size
+            if size < 4000:
+                return "note"
+    except OSError:
+        pass
+    return "doc"
 
 
 @main.command()
@@ -93,11 +279,46 @@ def read(ctx, source_slug, resume, dry_run, verbose):
     else:
         author, title = "Unknown", stem
 
+    # Detect source type from parent directory or author field
+    source_type = SourceType.BOOK
+    if source_path.parent == config.raw_papers:
+        source_type = SourceType.PAPER
+    elif source_path.parent == config.raw_articles:
+        source_type = SourceType.ARTICLE
+    elif source_path.parent == config.raw_meetings:
+        source_type = SourceType.MEETING
+    elif source_path.parent == config.raw_docs:
+        source_type = SourceType.DOC
+    elif source_path.parent == config.raw_notes:
+        source_type = SourceType.NOTE
+    elif author == "codebase":
+        source_type = SourceType.CODE
+
+    # Meeting-specific metadata from frontmatter
+    meeting_date = None
+    attendees: list[str] = []
+    if source_type == SourceType.MEETING:
+        from deep_reader.markdown import parse_frontmatter
+        from datetime import date as _date
+        fm, _body = parse_frontmatter(source_path.read_text(encoding="utf-8"))
+        if fm.get("title"):
+            title = fm["title"]
+        if fm.get("date"):
+            try:
+                parts = str(fm["date"]).split("-")
+                meeting_date = _date(int(parts[0]), int(parts[1]), int(parts[2]))
+            except Exception:
+                pass
+        if isinstance(fm.get("attendees"), list):
+            attendees = fm["attendees"]
+
     source = Source(
         path=source_path,
         title=title,
         author=author,
-        source_type=SourceType.BOOK,
+        source_type=source_type,
+        meeting_date=meeting_date,
+        attendees=attendees,
     )
 
     from deep_reader.llm import claude_code_llm
@@ -173,26 +394,336 @@ def rebuild_indexes(ctx):
 
 
 @main.command(name="compile-concepts")
+@click.option("--force", is_flag=True, help="Recompile existing concept articles")
 @click.pass_context
-def compile_concepts(ctx):
+def compile_concepts(ctx, force):
     """Generate concept articles for cross-source concepts."""
-    console.print("[yellow]Not yet implemented[/yellow]")
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+    from compile_concepts import compile_all
+    compile_all(ctx.obj["config"], force=force)
 
 
 @main.command()
-@click.argument("question")
+@click.argument("question", required=False, default=None)
 @click.option("--file-back", is_flag=True, help="Suggest where to file the output")
+@click.option("--context", default=None, help="Load an output file as additional context")
+@click.option("--file", "question_file", type=click.Path(exists=True), default=None, help="Read question from a file")
 @click.pass_context
-def query(ctx, question, file_back):
-    """Query the wiki with natural language."""
-    console.print("[yellow]Not yet implemented[/yellow]")
+def query(ctx, question, file_back, context, question_file):
+    """Query the wiki with natural language.
+
+    Pass QUESTION as an argument, or use --file to read from a file,
+    or pipe/type via stdin (end with Ctrl-D).
+    """
+    import sys
+
+    if question_file:
+        question = Path(question_file).read_text().strip()
+    elif question is None:
+        if sys.stdin.isatty():
+            console.print("[dim]Enter your question (Ctrl-D to submit):[/dim]")
+        question = sys.stdin.read().strip()
+        if not question:
+            console.print("[red]No question provided.[/red]")
+            return
+
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+    from query import run_query
+    run_query(ctx.obj["config"], question, file_back, context_file=context)
+
+
+@main.command()
+@click.option("--context", default=None, help="Load an output file as initial context")
+@click.pass_context
+def chat(ctx, context):
+    """Interactive conversational query session."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+    from chat import run_chat
+    run_chat(ctx.obj["config"], context_file=context)
+
+
+@main.command()
+@click.option("--fix", is_flag=True, help="Auto-repair simple issues")
+@click.pass_context
+def health(ctx, fix):
+    """Run wiki health check."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+    from health_check import run_health
+    run_health(ctx.obj["config"], fix=fix)
+
+
+@main.command()
+@click.option("--min-words", type=int, default=150, help="Word threshold for thin pages")
+@click.option("--max-pages", type=int, default=50, help="Max pages to enrich per run")
+@click.pass_context
+def enrich(ctx, min_words, max_pages):
+    """Enrich thin wiki pages with LLM-generated summaries."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+    from enrich import run_enrich
+    run_enrich(ctx.obj["config"], min_words, max_pages)
+
+
+@main.command(name="reconnect-threads")
+@click.pass_context
+def reconnect_threads(ctx):
+    """Scan all sources for cross-source evidence on existing threads."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+    from reconnect_threads import run_reconnect
+    run_reconnect(ctx.obj["config"])
+
+
+@main.command()
+@click.argument("source_slug")
+@click.pass_context
+def critique(ctx, source_slug):
+    """Critique a code source against the knowledge base."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+    from critique import run_critique
+    run_critique(ctx.obj["config"], source_slug)
+
+
+@main.group()
+def people():
+    """People management commands."""
+
+
+@people.command("list")
+@click.option("--query", default=None, help="Filter by name substring")
+@click.pass_context
+def people_list(ctx, query):
+    """List people in the knowledge base."""
+    from deep_reader.state import GlobalState
+    config = ctx.obj["config"]
+    state = GlobalState.load(config.state_file)
+    rows = list(state.people.values())
+    if query:
+        q = query.lower()
+        rows = [p for p in rows if q in p.name.lower() or q in (p.email or "").lower()]
+    rows.sort(key=lambda p: p.name.lower())
+    if not rows:
+        console.print("[dim]No people found.[/dim]")
+        return
+    for p in rows:
+        role = f" ({p.role})" if p.role else ""
+        email = f" <{p.email}>" if p.email else ""
+        console.print(f"  [bold]{p.name}[/bold]{role}{email} — {len(p.appearances)} sources")
+
+
+@people.command("show")
+@click.argument("name")
+@click.pass_context
+def people_show(ctx, name):
+    """Show a person's wiki page."""
+    from deep_reader.state import GlobalState
+    from deep_reader.steps.people import slugify_name
+    config = ctx.obj["config"]
+    state = GlobalState.load(config.state_file)
+    slug = slugify_name(name)
+    if slug not in state.people:
+        # Try name match
+        for p in state.people.values():
+            if p.name.lower() == name.lower() or name.lower() in [a.lower() for a in p.aliases]:
+                slug = p.slug
+                break
+    path = config.wiki_people / f"{slug}.md"
+    if not path.exists():
+        console.print(f"[red]No page for:[/red] {name}")
+        return
+    console.print(path.read_text())
+
+
+@people.command("merge")
+@click.argument("keep")
+@click.argument("drop")
+@click.pass_context
+def people_merge(ctx, keep, drop):
+    """Merge `drop` person into `keep` — preserves aliases, appearances, email."""
+    from deep_reader.state import GlobalState
+    from deep_reader.steps.people import merge_people, render_all_people, render_people_index
+    config = ctx.obj["config"]
+    state = GlobalState.load(config.state_file)
+    merged = merge_people(state, keep, drop)
+    state.save(config.state_file)
+    # Re-render pages
+    render_all_people(state, config.wiki_people)
+    render_people_index(state, config.wiki_indexes / "people.md")
+    # Remove the dropped page file if it exists
+    dropped_page = config.wiki_people / f"{drop}.md"
+    if dropped_page.exists():
+        dropped_page.unlink()
+    console.print(
+        f"[green]✓[/green] Merged [bold]{drop}[/bold] into [bold]{merged.name}[/bold]"
+    )
+
+
+@people.command("alias")
+@click.argument("person_slug")
+@click.argument("alias")
+@click.pass_context
+def people_alias(ctx, person_slug, alias):
+    """Add an alias to a person."""
+    from deep_reader.state import GlobalState
+    config = ctx.obj["config"]
+    state = GlobalState.load(config.state_file)
+    if person_slug not in state.people:
+        console.print(f"[red]Person not found:[/red] {person_slug}")
+        return
+    p = state.people[person_slug]
+    if alias not in p.aliases:
+        p.aliases.append(alias)
+    state.save(config.state_file)
+    console.print(f"[green]✓[/green] Added alias '{alias}' to {p.name}")
+
+
+@main.group()
+def actions():
+    """Action item commands — your personal to-do list."""
+
+
+@actions.command("list")
+@click.option("--status", default="open", type=click.Choice(["open", "done", "dropped", "all"]))
+@click.option("--waiting", is_flag=True, help="Show 'waiting on' items instead of mine")
+@click.pass_context
+def actions_list(ctx, status, waiting):
+    """List action items."""
+    from deep_reader.state import GlobalState
+    config = ctx.obj["config"]
+    state = GlobalState.load(config.state_file)
+    category = "waiting_on" if waiting else "mine"
+    items = [a for a in state.action_items if a.category == category]
+    if status != "all":
+        items = [a for a in items if a.status == status]
+    items.sort(key=lambda a: a.created_at)
+    if not items:
+        console.print("[dim]No items.[/dim]")
+        return
+    for a in items:
+        mark = "[x]" if a.status == "done" else "[ ]"
+        owner = ""
+        if waiting:
+            p = state.people.get(a.owner)
+            owner = f" (from {p.name if p else a.owner})"
+        console.print(f"  {mark} {a.description}{owner}  [dim]{a.id} — {a.source}[/dim]")
+
+
+@actions.command("add")
+@click.argument("description")
+@click.option("--owner", default=None, help="Person name if waiting-on; omit for mine")
+@click.option("--source", default="cli", help="Source slug to attribute this to")
+@click.pass_context
+def actions_add(ctx, description, owner, source):
+    """Add a new action item."""
+    from deep_reader.state import GlobalState
+    from deep_reader.steps import actions as actions_step
+    from deep_reader.wiki import Wiki, render_action_items, render_waiting_on
+    config = ctx.obj["config"]
+    state = GlobalState.load(config.state_file)
+    if owner:
+        item = actions_step.add_waiting_on(state, description, owner, source)
+    else:
+        item = actions_step.add_mine(state, description, source)
+    state.save(config.state_file)
+    wiki = Wiki(config)
+    render_action_items(wiki, state)
+    render_waiting_on(wiki, state)
+    console.print(f"[green]✓[/green] Added {item.id}: {item.description}")
+
+
+@actions.command("close")
+@click.argument("action_id")
+@click.pass_context
+def actions_close(ctx, action_id):
+    """Mark an action item done."""
+    from deep_reader.state import GlobalState
+    from deep_reader.steps import actions as actions_step
+    from deep_reader.wiki import Wiki, render_action_items, render_waiting_on
+    config = ctx.obj["config"]
+    state = GlobalState.load(config.state_file)
+    item = actions_step.close(state, action_id)
+    if not item:
+        console.print(f"[red]No item with id:[/red] {action_id}")
+        return
+    state.save(config.state_file)
+    wiki = Wiki(config)
+    render_action_items(wiki, state)
+    render_waiting_on(wiki, state)
+    console.print(f"[green]✓[/green] Closed: {item.description}")
 
 
 @main.command()
 @click.pass_context
-def health(ctx):
-    """Run wiki health check."""
-    console.print("[yellow]Not yet implemented[/yellow]")
+def mcp(ctx):
+    """Start the MCP server for this vault.
+
+    Register with Claude Desktop via claude_desktop_config.json to chat with
+    your vault. See README for the config snippet.
+    """
+    from deep_reader.mcp_server import build_server
+    config = ctx.obj["config"]
+    config.ensure_dirs()
+    server = build_server(config.vault_root)
+    server.run()
+
+
+@main.command(name="recap-prep")
+@click.option("--date", "target_date", default=None, help="Target date (YYYY-MM-DD); default today")
+@click.pass_context
+def recap_prep_cmd(ctx, target_date):
+    """Write a context file for the daily-recap skill."""
+    import sys
+    from datetime import date as _date
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+    from recap_prep import run_recap_prep
+    td = _date.fromisoformat(target_date) if target_date else None
+    path = run_recap_prep(ctx.obj["config"], td)
+    console.print(f"[green]✓[/green] Wrote {path}")
+
+
+@main.command(name="sync-recap")
+@click.option("--date", "target_date", default=None, help="Recap date (YYYY-MM-DD); default latest")
+@click.pass_context
+def sync_recap_cmd(ctx, target_date):
+    """Pull action items from a daily-recap file into the wiki."""
+    import sys
+    from datetime import date as _date
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+    from sync_recap import run_sync_recap
+    td = _date.fromisoformat(target_date) if target_date else None
+    run_sync_recap(ctx.obj["config"], td)
+
+
+@main.command(name="init-vault")
+@click.option("--name", prompt="Your full name", help="Vault owner name")
+@click.option("--email", prompt="Your email", help="Vault owner email")
+@click.option("--aliases", default="", help="Comma-separated aliases")
+@click.pass_context
+def init_vault(ctx, name, email, aliases):
+    """Initialize a fresh vault with owner config."""
+    import json as _json
+    from deep_reader.state import GlobalState, VaultOwner
+    config = ctx.obj["config"]
+    config.ensure_dirs()
+
+    # Seed _config.json (human-readable companion to _state.json)
+    alias_list = [a.strip() for a in aliases.split(",") if a.strip()]
+    if name and name not in alias_list:
+        alias_list.append(name)
+    owner_data = {"name": name, "email": email, "aliases": alias_list}
+    config.owner_config_file.write_text(_json.dumps(owner_data, indent=2))
+
+    # Mirror into state
+    state = GlobalState.load(config.state_file)
+    state.owner = VaultOwner(**owner_data)
+    state.save(config.state_file)
+    console.print(
+        f"[green]✓[/green] Initialized vault at {config.vault_root} for {name} <{email}>"
+    )
 
 
 @main.command()
@@ -230,15 +761,17 @@ def migrate(ctx):
 
 def _find_source(config, slug_or_name: str) -> Path | None:
     """Find a source file by slug or partial name match."""
-    for raw_dir in [config.raw_books, config.raw_articles, config.raw_papers]:
+    raw_dirs = [
+        config.raw_books, config.raw_articles, config.raw_papers,
+        config.raw_meetings, config.raw_docs, config.raw_notes,
+    ]
+    for raw_dir in raw_dirs:
         if not raw_dir.exists():
             continue
-        # Exact match
         for ext in [".md", ".txt"]:
             exact = raw_dir / (slug_or_name + ext)
             if exact.exists():
                 return exact
-        # Partial match
         for p in raw_dir.glob("*.md"):
             if slug_or_name.lower() in p.stem.lower():
                 return p

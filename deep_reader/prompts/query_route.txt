@@ -1,0 +1,34 @@
+You are routing a natural language question to the relevant articles in a knowledge base.
+
+## Question
+{question}
+
+## Available Sources
+{sources_listing}
+
+## Available Threads
+{threads_listing}
+
+## Available Concepts
+{concepts_listing}
+
+## Indexes
+{indexes}
+
+---
+
+Which articles should be loaded to answer this question? Respond with exactly this format:
+
+SOURCES:
+- source-slug-1
+- source-slug-2
+
+THREADS:
+- thread-name-1
+- thread-name-2
+
+CONCEPTS:
+- concept-name-1
+- concept-name-2
+
+Only list items that are directly relevant. If a category has no relevant items, write NONE after the heading.

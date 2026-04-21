@@ -28,6 +28,42 @@ class Config(BaseModel):
         return self.vault_root / "raw" / "papers"
 
     @property
+    def raw_meetings(self) -> Path:
+        return self.vault_root / "raw" / "meetings"
+
+    @property
+    def raw_docs(self) -> Path:
+        return self.vault_root / "raw" / "docs"
+
+    @property
+    def raw_notes(self) -> Path:
+        return self.vault_root / "raw" / "notes"
+
+    @property
+    def inbox(self) -> Path:
+        return self.vault_root / "inbox"
+
+    @property
+    def recaps(self) -> Path:
+        return self.vault_root / "recaps"
+
+    @property
+    def wiki_people(self) -> Path:
+        return self.vault_root / "wiki" / "people"
+
+    @property
+    def action_items_file(self) -> Path:
+        return self.vault_root / "wiki" / "action_items.md"
+
+    @property
+    def waiting_on_file(self) -> Path:
+        return self.vault_root / "wiki" / "waiting_on.md"
+
+    @property
+    def owner_config_file(self) -> Path:
+        return self.vault_root / "_config.json"
+
+    @property
     def wiki_sources(self) -> Path:
         return self.vault_root / "wiki" / "sources"
 
@@ -59,8 +95,10 @@ class Config(BaseModel):
         """Create all vault directories if they don't exist."""
         dirs = [
             self.raw_books, self.raw_articles, self.raw_papers,
+            self.raw_meetings, self.raw_docs, self.raw_notes,
+            self.inbox, self.recaps,
             self.wiki_sources, self.wiki_threads, self.wiki_concepts,
-            self.wiki_indexes, self.outputs,
+            self.wiki_indexes, self.wiki_people, self.outputs,
         ]
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)

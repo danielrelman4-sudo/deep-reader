@@ -4,9 +4,6 @@ dist/
 .venv/
 *.pyc
 .DS_Store
-vault/raw/
-vault/wiki/
-vault/outputs/
-vault/_state.json
-vault/.obsidian/
+# Vault data is personal — never committed.
+vault/
 read.log

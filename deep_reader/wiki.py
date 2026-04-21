@@ -118,3 +118,100 @@ class Wiki:
 
     def write_summary(self, content: str) -> None:
         self.config.wiki_summary.write_text(content)
+
+    # --- People ---
+
+    def read_person(self, slug: str) -> str | None:
+        path = self.config.wiki_people / f"{slug}.md"
+        return path.read_text() if path.exists() else None
+
+    def list_people_files(self) -> list[Path]:
+        d = self.config.wiki_people
+        if not d.exists():
+            return []
+        return sorted(d.glob("*.md"))
+
+
+# --- Module-level rendering helpers (operate on the GlobalState) ---
+
+def render_action_items(wiki: "Wiki", state) -> None:
+    """Render /vault/wiki/action_items.md from state.
+
+    Only items with category='mine' and status in (open, done) are surfaced.
+    """
+    from datetime import datetime, timedelta
+
+    mine = [a for a in state.action_items if a.category == "mine"]
+    open_items = [a for a in mine if a.status == "open"]
+    open_items.sort(key=lambda a: a.created_at)
+
+    cutoff = datetime.now() - timedelta(days=30)
+    done_items = [
+        a for a in mine
+        if a.status == "done" and a.completed_at and a.completed_at >= cutoff
+    ]
+    done_items.sort(key=lambda a: a.completed_at or datetime.min, reverse=True)
+
+    lines = ["# My Action Items\n"]
+    lines.append(f"_{len(open_items)} open_\n")
+    lines.append("## Open\n")
+    if not open_items:
+        lines.append("_(none)_\n")
+    else:
+        for a in open_items:
+            lines.append(
+                f"- [ ] {a.description} "
+                f"— from [[sources/{a.source}/_overview|{a.source}]] "
+                f"— since {a.created_at.date().isoformat()} "
+                f"<!-- id:{a.id} -->"
+            )
+        lines.append("")
+
+    if done_items:
+        lines.append("## Done (last 30 days)\n")
+        for a in done_items:
+            lines.append(
+                f"- [x] {a.description} "
+                f"— completed {a.completed_at.date().isoformat()}"
+            )
+        lines.append("")
+
+    path = wiki.config.action_items_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines))
+
+
+def render_waiting_on(wiki: "Wiki", state) -> None:
+    """Render /vault/wiki/waiting_on.md from state."""
+    items = [a for a in state.action_items if a.category == "waiting_on" and a.status == "open"]
+    items.sort(key=lambda a: (a.owner, a.created_at))
+
+    lines = ["# Waiting On\n"]
+    lines.append(f"_{len(items)} open items_\n")
+
+    if not items:
+        lines.append("_(none)_\n")
+    else:
+        current_owner = None
+        for a in items:
+            if a.owner != current_owner:
+                owner_name = _owner_display(state, a.owner)
+                lines.append(f"\n## {owner_name}\n")
+                current_owner = a.owner
+            lines.append(
+                f"- {a.description} "
+                f"— since {a.created_at.date().isoformat()} "
+                f"— re [[sources/{a.source}/_overview|{a.source}]] "
+                f"<!-- id:{a.id} -->"
+            )
+
+    path = wiki.config.waiting_on_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines))
+
+
+def _owner_display(state, owner_slug: str) -> str:
+    p = state.people.get(owner_slug)
+    if p:
+        return f"[[people/{p.slug}|{p.name}]]"
+    return owner_slug

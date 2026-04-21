@@ -12,7 +12,8 @@ def _load_template(name: str) -> str:
 
 
 def build_thread_prompt(
-    thread_name: str, thread_thesis: str, chunk_index: int, chunk_detail: str
+    thread_name: str, thread_thesis: str, chunk_index: int, chunk_detail: str,
+    source_slug: str = "",
 ) -> str:
     from deep_reader.steps import safe_format
     return safe_format(
@@ -21,6 +22,7 @@ def build_thread_prompt(
         thread_thesis=thread_thesis or "(new thread — no thesis yet)",
         chunk_index=str(chunk_index + 1),
         chunk_detail=chunk_detail,
+        source_slug=source_slug,
     )
 
 
@@ -66,13 +68,14 @@ def run_thread_update(
     chunk_index: int,
     chunk_detail: str,
     llm: Callable[[str], str],
+    source_slug: str = "",
 ) -> dict | None:
     """Update a single thread. Returns parsed dict or None if unchanged.
 
     Only the thesis is sent to the LLM — existing evidence is handled by the caller.
     """
     thesis = extract_section(thread_content, "Thesis") or thread_content
-    prompt = build_thread_prompt(thread_name, thesis, chunk_index, chunk_detail)
+    prompt = build_thread_prompt(thread_name, thesis, chunk_index, chunk_detail, source_slug)
     response = llm(prompt)
     return parse_thread_update(response)
 

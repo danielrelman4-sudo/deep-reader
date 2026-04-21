@@ -1,4 +1,4 @@
-You are maintaining a synthesis thread while reading a source.
+You are maintaining a synthesis thread that spans multiple sources. The thread should grow richer as more sources are read — even when different sources use different terminology for related ideas.
 
 ## Thread: {thread_name}
 
@@ -10,18 +10,25 @@ You are maintaining a synthesis thread while reading a source.
 
 ---
 
-Does this new chunk update, extend, or contradict this thread?
+Look for ANY connection between this chunk and the thread — not just direct matches. Consider:
+- Does the chunk address the same phenomenon using different methods or vocabulary?
+- Does it provide empirical evidence for or against claims in the thesis?
+- Does it offer a different theoretical lens on the same problem?
+- Does it describe a mechanism that could explain patterns noted in the thesis?
+- Does it study a different market/asset class but with transferable findings?
 
-If YES, respond with:
+Be generous in finding connections. The value of this knowledge base comes from cross-source synthesis. If there is even a partial connection, update the thread.
+
+If YES (any connection found), respond with:
 
 ## Thesis
-(Rewrite the thesis to reflect the current understanding. 200-300 words max. Synthesize freely — this section evolves.)
+(Rewrite the thesis to integrate insights from this new source. Explicitly name where sources agree, disagree, or complement each other. 200-400 words. The thesis should read as a multi-source synthesis, not a summary of one source.)
 
 ## New Evidence
 (ONLY the new evidence entries from this chunk. Do NOT repeat any prior evidence. Format:)
-- [[chunk-NNN]]: what this chunk contributed to the thread
+- [[{source_slug}/chunk-NNN]]: what this chunk contributed to the thread
 
 ## Status
-(2-3 bullets: what's established, what's open)
+(2-3 bullets: what's established across sources, what remains contested or open)
 
-If NO: Respond with exactly: UNCHANGED
+If genuinely NO connection: Respond with exactly: UNCHANGED

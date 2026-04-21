@@ -1,0 +1,71 @@
+You are compiling a short source (meeting note, doc, or note) into a structured wiki page in ONE pass. Do extract + thread-connect + people + action-items together.
+
+## Vault Owner
+The person maintaining this knowledge base is:
+{owner_name} (email: {owner_email})
+Aliases: {owner_aliases}
+
+When extracting action items, an item is "mine" only if it is owned by the vault owner. Items owned by anyone else go under "Waiting On" (they're owed to the vault owner) or "Other Commitments" (between other parties).
+
+## Source Metadata
+Type: {source_type}
+Title: {title}
+Date: {source_date}
+Known attendees: {known_attendees}
+
+## Existing Threads
+{thread_list}
+
+## Existing People
+{known_people}
+
+## Source Content
+{body}
+
+---
+
+Produce a single response with the following sections, in this exact order. Keep it concise — do not pad.
+
+## Summary
+2–4 sentences capturing what this source is about and the key outcomes/decisions. Do not restate the source verbatim.
+
+## Attendees
+List every person who appears, with their role if inferable. Use the provided known attendees plus anyone else named in the content. Format: `- **Name** — role/context`. Use exact full names when possible; emails in parentheses if helpful.
+
+## Key Entities
+People, orgs, products mentioned. Format: `- **Name**: brief context`. Skip if the "Attendees" section already covers everything.
+
+## Decisions
+Concrete decisions made. Bullet list. If none, write `(none)`.
+
+## My Action Items
+Items owned by the vault owner ({owner_name}). Format: `- [ ] description` — one per line, no owner label needed.
+If none: `(none)`.
+
+## Waiting On
+Items owed to the vault owner by other named people. Format: `- **<Person>**: description`.
+If none: `(none)`.
+
+## Other Commitments
+Items between other parties (neither involving the vault owner). Format: `- **<Person>**: description`.
+If none: `(none)`.
+
+## Thread Updates
+For any existing thread from the list above that this source meaningfully advances, format:
+```
+### <thread-slug>
+- New evidence: one-sentence statement of what this source adds, with any relevant quote.
+```
+If no existing threads are advanced, write `(none)`.
+
+## New Threads
+If this source introduces a theme significant enough to track across future sources, propose a new thread. Format:
+```
+### <slug-name>
+Thesis: 1–2 sentence claim this thread tracks.
+```
+Only propose new threads for genuinely recurring themes — not one-off topics. If none, write `(none)`.
+
+## Concepts
+Concept tags to link this source to. Format: `- [[concept-name]]: one-line description`.
+If none, write `(none)`.
