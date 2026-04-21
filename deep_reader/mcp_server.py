@@ -204,22 +204,20 @@ def build_server(vault_root: Path):
     def add_action_item(description: str, source: str = "chat") -> dict:
         """Add a new personal action item (owned by the vault owner)."""
         from deep_reader.steps import actions as actions_step
-        from deep_reader.wiki import render_action_items
         state = GlobalState.load(config.state_file)
         item = actions_step.add_mine(state, description, source)
         state.save(config.state_file)
-        render_action_items(Wiki(config), state)
+        _rerender_after_action_change(config, state, item)
         return _dump_action(item)
 
     @mcp.tool()
     def add_waiting_on(description: str, person: str, source: str = "chat") -> dict:
         """Add a waiting-on item owed by a specific person."""
         from deep_reader.steps import actions as actions_step
-        from deep_reader.wiki import render_waiting_on
         state = GlobalState.load(config.state_file)
         item = actions_step.add_waiting_on(state, description, person, source)
         state.save(config.state_file)
-        render_waiting_on(Wiki(config), state)
+        _rerender_after_action_change(config, state, item)
         return _dump_action(item, state)
 
     @mcp.tool()
@@ -257,35 +255,50 @@ def build_server(vault_root: Path):
             thread_path.write_text(assemble_thread(thesis, new_evidence, status))
             threads_touched.append(thread_path.stem)
 
-        del state.sources[source_slug]
-        for p in state.people.values():
-            if source_slug in p.appearances:
-                p.appearances.remove(source_slug)
+        affected_owners = {a.owner for a in removed_actions}
+        people_with_removed_appearance = [
+            p for p in state.people.values() if source_slug in p.appearances
+        ]
+        for p in people_with_removed_appearance:
+            p.appearances.remove(source_slug)
 
+        del state.sources[source_slug]
         state.save(config.state_file)
+
         from deep_reader.wiki import render_action_items, render_waiting_on
+        from deep_reader.steps import people as people_step
         render_action_items(wiki, state)
         render_waiting_on(wiki, state)
+
+        # Re-render every person page whose appearance list shrank or whose
+        # waiting-on items were part of this source.
+        to_refresh = {p.slug for p in people_with_removed_appearance} | affected_owners
+        for p in state.people.values():
+            if state.owner.matches(p.name) or state.owner.matches(p.email or ""):
+                to_refresh.add(p.slug)
+        for slug in to_refresh:
+            if slug in state.people:
+                people_step.render_person_page(
+                    state.people[slug], state, config.wiki_people
+                )
 
         return {
             "forgotten": source_slug,
             "action_items_removed": len(removed_actions),
             "threads_scrubbed": threads_touched,
+            "people_pages_refreshed": len(to_refresh),
         }
 
     @mcp.tool()
     def close_action_item(id: str) -> dict:
         """Mark an action item (mine or waiting-on) as done."""
         from deep_reader.steps import actions as actions_step
-        from deep_reader.wiki import render_action_items, render_waiting_on
         state = GlobalState.load(config.state_file)
         item = actions_step.close(state, id)
         if not item:
             return {"error": f"no item with id {id}"}
         state.save(config.state_file)
-        wiki = Wiki(config)
-        render_action_items(wiki, state)
-        render_waiting_on(wiki, state)
+        _rerender_after_action_change(config, state, item)
         return _dump_action(item, state)
 
     @mcp.tool()
@@ -873,6 +886,37 @@ When you call `record_meeting`, pass these fields:
 
 
 # ---------- helpers ----------
+
+
+def _rerender_after_action_change(config: Config, state, item) -> None:
+    """Re-render every view that depends on a single action item.
+
+    Called after add_action_item / add_waiting_on / close_action_item. Without
+    this, per-person pages go stale relative to the central action_items.md
+    and waiting_on.md files — e.g. closing a waiting-on item would update
+    waiting_on.md but leave the owner's person page showing it as still open.
+    """
+    from deep_reader.wiki import Wiki, render_action_items, render_waiting_on
+    from deep_reader.steps import people as people_step
+
+    wiki = Wiki(config)
+    render_action_items(wiki, state)
+    render_waiting_on(wiki, state)
+
+    # Re-render person pages that reference this item.
+    slugs_to_refresh: set[str] = set()
+    if item is not None:
+        slugs_to_refresh.add(item.owner)
+    # Vault owner page shows "My open action items" — refresh whenever any
+    # mine item is touched (owner could be the vault owner slug, but the
+    # match by name/email is authoritative).
+    for p in state.people.values():
+        if state.owner.matches(p.name) or state.owner.matches(p.email or ""):
+            slugs_to_refresh.add(p.slug)
+
+    for slug in slugs_to_refresh:
+        if slug in state.people:
+            people_step.render_person_page(state.people[slug], state, config.wiki_people)
 
 
 def _do_structured_record(

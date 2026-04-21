@@ -618,7 +618,6 @@ def actions_add(ctx, description, owner, source):
     """Add a new action item."""
     from deep_reader.state import GlobalState
     from deep_reader.steps import actions as actions_step
-    from deep_reader.wiki import Wiki, render_action_items, render_waiting_on
     config = ctx.obj["config"]
     state = GlobalState.load(config.state_file)
     if owner:
@@ -626,9 +625,7 @@ def actions_add(ctx, description, owner, source):
     else:
         item = actions_step.add_mine(state, description, source)
     state.save(config.state_file)
-    wiki = Wiki(config)
-    render_action_items(wiki, state)
-    render_waiting_on(wiki, state)
+    _rerender_after_action_change_cli(config, state, item)
     console.print(f"[green]✓[/green] Added {item.id}: {item.description}")
 
 
@@ -639,7 +636,6 @@ def actions_close(ctx, action_id):
     """Mark an action item done."""
     from deep_reader.state import GlobalState
     from deep_reader.steps import actions as actions_step
-    from deep_reader.wiki import Wiki, render_action_items, render_waiting_on
     config = ctx.obj["config"]
     state = GlobalState.load(config.state_file)
     item = actions_step.close(state, action_id)
@@ -647,10 +643,24 @@ def actions_close(ctx, action_id):
         console.print(f"[red]No item with id:[/red] {action_id}")
         return
     state.save(config.state_file)
+    _rerender_after_action_change_cli(config, state, item)
+    console.print(f"[green]✓[/green] Closed: {item.description}")
+
+
+def _rerender_after_action_change_cli(config, state, item) -> None:
+    """Shared refresh: central lists + affected person pages."""
+    from deep_reader.wiki import Wiki, render_action_items, render_waiting_on
+    from deep_reader.steps import people as people_step
     wiki = Wiki(config)
     render_action_items(wiki, state)
     render_waiting_on(wiki, state)
-    console.print(f"[green]✓[/green] Closed: {item.description}")
+    slugs_to_refresh = {item.owner} if item else set()
+    for p in state.people.values():
+        if state.owner.matches(p.name) or state.owner.matches(p.email or ""):
+            slugs_to_refresh.add(p.slug)
+    for slug in slugs_to_refresh:
+        if slug in state.people:
+            people_step.render_person_page(state.people[slug], state, config.wiki_people)
 
 
 @main.command()
@@ -775,18 +785,31 @@ def forget(ctx, source_slug, yes):
         thread_path.write_text(assemble_thread(thesis, new_evidence, status))
         threads_touched.append(thread_path.stem)
 
-    # Remove from source state
-    del state.sources[source_slug]
-    # Remove from any person's appearances
-    for p in state.people.values():
-        if source_slug in p.appearances:
-            p.appearances.remove(source_slug)
+    affected_owners = {a.owner for a in removed_actions}
+    people_with_removed_appearance = [
+        p for p in state.people.values() if source_slug in p.appearances
+    ]
+    for p in people_with_removed_appearance:
+        p.appearances.remove(source_slug)
 
+    del state.sources[source_slug]
     state.save(config.state_file)
 
-    # Re-render central lists
     render_action_items(wiki, state)
     render_waiting_on(wiki, state)
+
+    # Re-render affected person pages (owners, people who appeared in this
+    # source, and always the vault owner).
+    from deep_reader.steps import people as people_step
+    to_refresh = {p.slug for p in people_with_removed_appearance} | affected_owners
+    for p in state.people.values():
+        if state.owner.matches(p.name) or state.owner.matches(p.email or ""):
+            to_refresh.add(p.slug)
+    for slug in to_refresh:
+        if slug in state.people:
+            people_step.render_person_page(
+                state.people[slug], state, config.wiki_people
+            )
 
     console.print(f"[green]✓[/green] Forgot [bold]{source_slug}[/bold]")
     console.print(
