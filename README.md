@@ -85,8 +85,16 @@ Ask Claude things like:
 - "What are my open action items?"
 - "Who have I met with this week?"
 - "What did we decide in the last Acme meeting?"
-- "Ingest the file I just dropped in my inbox."
-- "Add an action item: send the pricing deck to Jane."
+- "Tell me about Duckbill" — deep search is the default; you get a grounded answer quoting actual vault content, not a reconstruction
+- "Ingest this meeting note: [paste]"
+- "Ingest what's in my inbox"
+- "Add an action item: send the pricing deck to Jane"
+
+### Chat design: deep by default, lite on demand
+
+Natural-language questions trigger **deep retrieval** automatically. Claude's `search` tool returns the full content of the top 3 source hits and top 3 thread hits inline (~2–3k tokens per call), so Claude can quote or paraphrase actual decisions, attendees, and evidence rather than reasoning from general knowledge about the topic.
+
+Use the `/quick_scan <term>` slash command when you just want to see what sources/threads mention a term — no synthesis, tight bullet list, lower token cost.
 
 ### Available tools
 
@@ -94,19 +102,20 @@ Ask Claude things like:
 
 | Tool | Purpose |
 |---|---|
-| `get_ingest_context` | Returns vault owner + active threads (with theses) + known people. Call this first before analyzing a source. |
-| `read_inbox_file(filename)` | Returns extracted text of a file in `vault/inbox/` (PDF/docx/md/txt) |
-| `record_meeting(...)` | Persist a meeting Claude has analyzed — accepts title, date, body, summary, attendees, decisions, action items, waiting-on, thread updates, new threads, concepts |
-| `record_note(...)` | Same for short notes |
-| `record_doc(...)` | Same for internal docs/briefs |
+| `get_ingest_context` | Vault owner + active threads (with theses) + known people. Claude calls this first before analyzing a source. |
+| `read_inbox_file(filename)` | Extracted text of a file in `vault/inbox/` (PDF / docx / md / txt / rtf) |
+| `record_meeting(...)` | Persist a meeting Claude has analyzed — structured payload: title, date, body, summary, attendees, decisions, action items, waiting-on, thread updates, new threads, concepts |
+| `record_note(...)` | Same for short notes (no attendees / decisions / date) |
+| `record_doc(...)` | Same for docs / briefs / decks / reports — attendees optional, still pulls threads & concepts |
 | `move_inbox_file(filename, type)` | Archive a processed inbox file into `raw/{type}/` |
-| `search` | Cross-entity search (sources, threads, concepts, people, action items) |
+| `search(query, depth="full"|"lite")` | Cross-entity search. `depth="full"` (default) returns full content of top source+thread hits; `"lite"` returns snippets only |
+| `get_source(slug)` | Full content of a single source — overview + all chunks with decisions, attendees, structured analysis |
 | `list_action_items` / `list_waiting_on` | Your to-do list / items owed by others |
-| `add_action_item` / `add_waiting_on` / `close_action_item` | Action-item CRUD |
+| `add_action_item` / `add_waiting_on` / `close_action_item` | Action-item CRUD. Mutations re-render the affected person pages + central lists so state stays consistent. |
 | `list_people` / `get_person` / `merge_people` | People directory |
-| `forget_source(slug)` | Remove a source's page, state, action items, and thread evidence |
+| `forget_source(slug)` | Remove a source's page, state, attributed action items, and thread evidence. Raw file preserved. |
 | `recap_prep` / `sync_recap` | Daily-recap skill integration |
-| `list_inbox` | See what's in the inbox waiting to be processed |
+| `list_inbox` | See what's waiting to be processed |
 
 **Legacy tools (require `ANTHROPIC_API_KEY` on the server):**
 
@@ -115,26 +124,38 @@ Ask Claude things like:
 | `ingest_meeting` / `ingest_note` | Server-side LLM analyzes and persists in one call |
 | `ingest_file` / `ingest_file_bytes` | Same for files |
 
-Prefer the `record_*` tools — the legacy tools exist only for users running their own API key / CLI batch flows.
+Prefer the `record_*` tools — the legacy tools exist for users running their own API key / CLI batch flows.
 
 ### Available resources
 
-`vault://summary` · `vault://action_items` · `vault://waiting_on` · `vault://people` · `vault://people/{slug}` · `vault://sources/{slug}` · `vault://threads/{name}` · `vault://recaps/{date}` · `vault://inbox`
+`vault://summary` · `vault://action_items` · `vault://waiting_on` · `vault://people` · `vault://people/{slug}` · `vault://sources/{slug}` (full content, overview + chunks) · `vault://threads/{name}` · `vault://recaps/{date}` · `vault://inbox`
 
-### Available prompts (one-click workflows)
+### Available prompts (slash commands in Claude Desktop)
 
-Claude Desktop surfaces MCP prompts as saved workflows. All prompts drive Claude through the no-API-key flow: `get_ingest_context` → analyze → `record_*` tools.
-
-| Prompt | What it does |
+| Prompt | Purpose |
 |---|---|
-| `ingest_meeting_paste` | Paste a meeting into chat next; Claude analyzes and records it |
-| `ingest_inbox` | Process every file in `vault/inbox/` — reads each, analyzes, records, archives |
-| `ingest_granola_today` | Pulls today's meetings from Granola MCP and records each one |
-| `ingest_granola_week` | Last 7 days; skips anything already in the vault |
-| `ingest_granola_range(start, end)` | Arbitrary date range |
-| `catch_me_up` | Reads state and returns a concise brief of open items + recent activity |
+| `/ingest_meeting_paste` | Paste a meeting next; Claude analyzes + records it |
+| `/ingest_doc_paste` | Paste a doc / brief / deck / report — no-people flow, still pulls threads + concepts |
+| `/ingest_inbox` | Process every file in `vault/inbox/`; dedup-skips anything already present |
+| `/ingest_granola_today` | Pulls today's meetings from Granola MCP and records each |
+| `/ingest_granola_week` | Last 7 days; skips duplicates |
+| `/ingest_granola_range(start, end)` | Arbitrary date range |
+| `/quick_scan(term)` | Lightweight scan — no synthesis, just what the vault has on a term |
+| `/deep_query(question)` | Force deep retrieve-then-synthesize pattern. Usually unnecessary (default `search` already does this) — fallback if Claude ever answers from snippets. |
+| `/catch_me_up` | Concise brief of open items, recent activity, one thing to do next |
 
-The `ingest_granola_*` prompts require Granola's own MCP server to be registered alongside this one (see "Granola integration" below).
+The `/ingest_granola_*` prompts require Granola's own MCP server to be registered alongside this one (see "Granola integration" below).
+
+### Typed schema for structured tools
+
+`record_meeting`, `record_doc`, `record_note` accept nested structured payloads. The nested types have strict schemas so validation errors at the tool boundary are meaningful (not `KeyError: 'body'` from the downstream pipeline). Types:
+
+- `Attendee`: `{name: str, role?: str, email?: str}` — `name` required
+- `ThreadUpdate`: `{slug: str, body: str}` — both required; `body` is a one-sentence evidence entry
+- `NewThread`: `{slug: str, thesis: str}` — both required
+- `PersonItem`: `{person: str, description: str}` — both required (used for `waiting_on` / `other_commitments`)
+
+Claude Desktop gets these as JSON Schema via `inputSchema` on each tool — it sees the contract before calling.
 
 ## Granola integration
 
@@ -239,10 +260,12 @@ people list [--query <q>]
 people show <name>
 people merge <keep-slug> <drop-slug>
 people alias <slug> <alias>
+forget <source-slug>         Remove a source + its attributed state
 init-vault
 recap-prep [--date YYYY-MM-DD]
 sync-recap [--date YYYY-MM-DD]
 mcp
+watch [--interval N] [--once]   Auto-ingest inbox (requires API key)
 chat                         (terminal chat — dev tool; prefer MCP)
 ```
 

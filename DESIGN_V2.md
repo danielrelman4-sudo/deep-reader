@@ -2,6 +2,8 @@
 
 Design for refactor before handing the tool to the head of growth/ops as primary user.
 
+> **Status (2026-04-21):** Shipped as v2.0.0. Architecture evolved beyond this doc during implementation — most notably, the MCP server became a structured-data sink (no server-side LLM calls) with Claude Desktop doing the analysis on the user's own subscription, and search became "deep by default" returning full content inline rather than routing snippets. See [CHANGELOG.md](CHANGELOG.md) for what actually shipped and [README.md](README.md) for current usage. This doc is preserved as the original design intent.
+
 ## Context shift
 
 **Old primary use case**: solo long-form reader — 300-page books compiled iteratively over many chunks.
