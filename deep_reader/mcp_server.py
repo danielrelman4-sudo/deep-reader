@@ -604,10 +604,17 @@ def build_server(vault_root: Path):
         new_threads: list[dict] | None = None,
         concepts: list[str] | None = None,
     ) -> dict:
-        """Persist a doc/strategy piece/brief that Claude has analyzed.
+        """Persist a doc / strategy brief / slide deck / competitive report.
 
-        Docs may have authors/stakeholders (treated like attendees) and the
-        other fields from meetings, minus decisions and date.
+        Unlike meetings, most docs have no people attached — pass attendees=[]
+        (or omit it) rather than inventing authors. Same for action items —
+        pass [] if the doc doesn't assign work. The doc still gets indexed,
+        summarized, and connected to threads + concepts regardless.
+
+        thread_updates, new_threads, and concepts still matter for docs and
+        should NOT be empty if the doc relates to existing work or
+        introduces a tracked theme. Those are how docs connect to the rest
+        of the vault.
         """
         return _do_structured_record(
             config=config, source_type="doc",
@@ -726,27 +733,40 @@ def build_server(vault_root: Path):
     # covers all the model work.
 
     ANALYZE_SCHEMA = """
-When you call `record_meeting`, pass these fields:
-- title (string)
-- date (YYYY-MM-DD, if known)
-- body (string) — the full original meeting text, unmodified
-- summary (string) — 2-4 sentences capturing outcome and decisions
-- attendees (list) — each {name, role?, email?}
-- decisions (list of strings)
-- action_items_mine (list of strings) — items owned by the vault owner ONLY.
-  Check `get_ingest_context().owner` for who that is; items owned by anyone
-  else belong in waiting_on or other_commitments, NOT here.
-- waiting_on (list) — each {person, description}. Items owed TO the vault
-  owner by another named person.
-- other_commitments (list) — each {person, description}. Items between other
-  parties that don't involve the vault owner.
+Pick the right record_* tool for the source type:
+- record_meeting — conversations with attendees + decisions + follow-ups
+- record_doc — docs, strategy briefs, slide decks, competitive briefs,
+  research reports, one-pagers, anything authored rather than discussed.
+  Most of these have no attendees and no action items — that's fine.
+- record_note — short personal note, clip, jotting
+
+Fields (ALL are optional except title/body/summary — pass only what's
+present in the source, omit or pass [] for anything that isn't):
+- title (string, required)
+- body (string, required) — the original text, unmodified
+- summary (string, required) — 2-4 sentences capturing the gist
+- date (YYYY-MM-DD, meetings only, if known)
+- attendees (list) — each {name, role?, email?}. Omit for docs/decks
+  with no explicit author or participant list. For docs WITH authors,
+  pass the author as a single-entry attendees list with their role.
+- decisions (list of strings) — meetings only, usually
+- action_items_mine (list of strings) — items owned by the vault owner
+  ONLY. Check `get_ingest_context().owner` for who that is; items owned
+  by anyone else belong in waiting_on or other_commitments, NOT here.
+  Empty [] is common for docs that don't assign work.
+- waiting_on (list) — each {person, description}. Items owed TO the
+  vault owner by a named person. Empty [] is fine.
+- other_commitments (list) — each {person, description}. Items between
+  other parties that don't involve the vault owner.
 - thread_updates (list) — each {slug, body}. For every thread in
   get_ingest_context().threads whose thesis this source meaningfully
   advances, produce a one-sentence evidence entry (not a rewrite of the
-  thesis).
+  thesis). THIS MATTERS EVEN FOR DOCS WITH NO PEOPLE — a competitive
+  brief can and should advance threads it relates to.
 - new_threads (list) — each {slug, thesis}. Only for genuinely recurring
   themes introduced here that would be worth tracking across future sources.
 - concepts (list of strings) — concept slugs relevant to this source.
+  Important even for docs — how you graduate ideas to concept articles.
 """.strip()
 
     @mcp.prompt(
@@ -774,6 +794,38 @@ When you call `record_meeting`, pass these fields:
             "\n"
             "After recording, summarize what changed: attendees added, new "
             "people, new action items on my list, threads advanced."
+        )
+
+    @mcp.prompt(
+        description=(
+            "Analyze a pasted doc, brief, slide deck, or report and record "
+            "it in the vault. Works for sources with no attendees / no "
+            "action items — still pulls out threads and concepts."
+        ),
+    )
+    def ingest_doc_paste() -> str:
+        return (
+            "I'll paste a doc, brief, slide deck, or report as my next "
+            "message. Steps:\n"
+            "1. Call `get_ingest_context()` for threads, people, owner.\n"
+            "2. Read the content.\n"
+            "3. Call `record_doc(...)` with the structured analysis. If "
+            "the doc has no explicit author/attendee list, pass "
+            "attendees=[] and don't invent anyone. If it has no action "
+            "items assigned to anyone, pass action_items_mine=[] and "
+            "waiting_on=[]. That's normal for a strategy doc or brief.\n"
+            "\n"
+            "The fields that MUST be populated even for a people-less doc: "
+            "summary, thread_updates (if it meaningfully advances any "
+            "existing thread), new_threads (if it introduces a recurring "
+            "theme), concepts (always). The whole point is this doc "
+            "still connects to existing work even without people attached.\n"
+            "\n"
+            f"{ANALYZE_SCHEMA}\n"
+            "\n"
+            "After recording, summarize: threads advanced or created, "
+            "concepts tagged, anything that now connects to existing "
+            "work in the vault."
         )
 
     @mcp.prompt(
