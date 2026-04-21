@@ -223,6 +223,57 @@ def build_server(vault_root: Path):
         return _dump_action(item, state)
 
     @mcp.tool()
+    def forget_source(source_slug: str) -> dict:
+        """Remove a source from the vault: its page, state, attributed action
+        items, and any thread evidence referencing it. The raw file in raw/
+        is preserved. People records are NOT deleted (they may appear in
+        other sources) — this just decrements their appearance list.
+        """
+        import shutil
+        from deep_reader.thread_utils import extract_section, assemble_thread
+        state = GlobalState.load(config.state_file)
+        wiki = Wiki(config)
+        if source_slug not in state.sources:
+            return {"error": f"no source with slug '{source_slug}'"}
+
+        src_dir = wiki.source_dir(source_slug)
+        if src_dir.exists():
+            shutil.rmtree(src_dir)
+
+        removed_actions = [a for a in state.action_items if a.source == source_slug]
+        state.action_items = [a for a in state.action_items if a.source != source_slug]
+
+        evidence_ref = f"[[{source_slug}/"
+        threads_touched = []
+        for thread_path in config.wiki_threads.glob("*.md"):
+            content = thread_path.read_text()
+            evidence = extract_section(content, "Evidence")
+            if evidence_ref not in evidence:
+                continue
+            new_lines = [line for line in evidence.split("\n") if evidence_ref not in line]
+            new_evidence = "\n".join(new_lines).strip() or "(no evidence yet)"
+            thesis = extract_section(content, "Thesis")
+            status = extract_section(content, "Status")
+            thread_path.write_text(assemble_thread(thesis, new_evidence, status))
+            threads_touched.append(thread_path.stem)
+
+        del state.sources[source_slug]
+        for p in state.people.values():
+            if source_slug in p.appearances:
+                p.appearances.remove(source_slug)
+
+        state.save(config.state_file)
+        from deep_reader.wiki import render_action_items, render_waiting_on
+        render_action_items(wiki, state)
+        render_waiting_on(wiki, state)
+
+        return {
+            "forgotten": source_slug,
+            "action_items_removed": len(removed_actions),
+            "threads_scrubbed": threads_touched,
+        }
+
+    @mcp.tool()
     def close_action_item(id: str) -> dict:
         """Mark an action item (mine or waiting-on) as done."""
         from deep_reader.steps import actions as actions_step
@@ -306,18 +357,31 @@ def build_server(vault_root: Path):
 
     @mcp.tool()
     def ingest_file(filename: str, source_type: str | None = None) -> dict:
-        """Ingest a file from vault/inbox/. Moves it to raw/ on success."""
+        """LEGACY: ingest a file from inbox with server-side LLM analysis.
+
+        Requires ANTHROPIC_API_KEY. For the default workflow, use
+        read_inbox_file + record_meeting/record_note/record_doc +
+        move_inbox_file instead — no API key needed.
+        """
+        import os
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return {
+                "error": (
+                    "ingest_file requires ANTHROPIC_API_KEY. Use the "
+                    "no-API-key flow: read_inbox_file(filename) → "
+                    "record_meeting/record_note/record_doc → "
+                    "move_inbox_file(filename, type)."
+                )
+            }
         src = config.inbox / filename
         if not src.exists():
             return {"error": f"inbox/{filename} not found"}
         stype = source_type or _auto_detect_type_path(src)
         _ingest_path(config, src, stype)
-        # Move out of inbox
         dest_dir = _raw_dir_for(config, stype)
         dest_dir.mkdir(parents=True, exist_ok=True)
         final = dest_dir / src.name
         src.rename(final)
-        # Now read it
         _read_new_source(config, final, stype)
         return {"ingested": str(final), "source_type": stype}
 
@@ -328,16 +392,258 @@ def build_server(vault_root: Path):
         mime_type: str | None = None,
         source_type: str | None = None,
     ) -> dict:
-        """Ingest a file supplied inline as base64 (for clients that can't drop into inbox)."""
+        """LEGACY: ingest an inline base64 file with server-side LLM.
+
+        Requires ANTHROPIC_API_KEY. Prefer the no-API-key flow.
+        """
+        import os
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return {"error": "ingest_file_bytes requires ANTHROPIC_API_KEY."}
         data = base64.b64decode(content_base64)
         tmp = config.inbox / filename
         config.inbox.mkdir(parents=True, exist_ok=True)
         tmp.write_bytes(data)
         return ingest_file(filename, source_type)
 
+    # ---------- NEW: structured ingest (no LLM on server side) ----------
+    #
+    # These tools accept data Claude Desktop has already analyzed. Our server
+    # just persists it — no API key, no server-side LLM calls. This is the
+    # primary flow for users running everything through their own Claude
+    # account. See the MCP prompts below for the exact schema Claude must
+    # produce to call these.
+
+    @mcp.tool()
+    def get_ingest_context() -> dict:
+        """Return everything Claude needs to parse a new source well.
+
+        Includes: vault owner identity (for the mine/waiting-on split), all
+        active threads with their theses (so new sources can extend them),
+        and all known people with aliases (so attendees resolve correctly).
+        Call this first before analyzing a new source.
+        """
+        state = GlobalState.load(config.state_file)
+        wiki = Wiki(config)
+        threads = []
+        for slug in state.global_threads:
+            content = wiki.read_thread(slug) or ""
+            from deep_reader.thread_utils import extract_section
+            thesis = extract_section(content, "Thesis") if content else ""
+            threads.append({"slug": slug, "thesis": thesis})
+        people = [
+            {
+                "slug": p.slug, "name": p.name, "email": p.email,
+                "role": p.role, "aliases": p.aliases,
+            }
+            for p in state.people.values()
+        ]
+        return {
+            "owner": {
+                "name": state.owner.name,
+                "email": state.owner.email,
+                "aliases": state.owner.aliases,
+            },
+            "threads": threads,
+            "people": people,
+            "source_count": len(state.sources),
+        }
+
+    @mcp.tool()
+    def read_inbox_file(filename: str) -> dict:
+        """Return the text content of a file sitting in vault/inbox/.
+
+        Handles PDF, .docx, .md, .txt, .rtf. Returns the extracted text for
+        Claude to analyze — does NOT move the file out of the inbox. Use
+        record_meeting / record_note / record_doc to persist, then call
+        move_inbox_file to archive the original.
+        """
+        src = config.inbox / filename
+        if not src.exists():
+            return {"error": f"inbox/{filename} not found"}
+        suffix = src.suffix.lower()
+        try:
+            if suffix in {".md", ".txt", ".rtf"}:
+                text = src.read_text(errors="replace")
+            elif suffix == ".pdf":
+                from deep_reader.sources.pdf import extract_pdf
+                text = extract_pdf(src)
+            elif suffix == ".docx":
+                try:
+                    import docx
+                except ImportError:
+                    return {"error": "python-docx not installed (pip install 'deep-reader[docx]')"}
+                doc = docx.Document(str(src))
+                text = "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            else:
+                return {"error": f"unsupported file type: {suffix}"}
+        except Exception as e:
+            return {"error": f"failed to read {filename}: {e}"}
+        return {
+            "filename": filename,
+            "suffix": suffix,
+            "size": src.stat().st_size,
+            "text": text,
+            "suggested_type": _auto_detect_type_path(src),
+        }
+
+    @mcp.tool()
+    def move_inbox_file(filename: str, source_type: str) -> dict:
+        """Archive a processed inbox file into raw/{type}/ after ingest.
+
+        Call this after record_meeting/record_note/record_doc succeeds, so
+        the inbox stays clean and the original file is preserved alongside
+        the compiled wiki page.
+        """
+        src = config.inbox / filename
+        if not src.exists():
+            return {"error": f"inbox/{filename} not found"}
+        dest_dir = _raw_dir_for(config, source_type)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / filename
+        src.rename(dest)
+        return {"archived": str(dest.relative_to(config.vault_root))}
+
+    @mcp.tool()
+    def record_meeting(
+        title: str,
+        body: str,
+        summary: str,
+        attendees: list[dict] | None = None,
+        decisions: list[str] | None = None,
+        action_items_mine: list[str] | None = None,
+        waiting_on: list[dict] | None = None,
+        other_commitments: list[dict] | None = None,
+        thread_updates: list[dict] | None = None,
+        new_threads: list[dict] | None = None,
+        concepts: list[str] | None = None,
+        date: str | None = None,
+    ) -> dict:
+        """Persist a meeting Claude has already analyzed.
+
+        Schema expectations:
+          - attendees: [{name, role?, email?}]
+          - decisions: [str]
+          - action_items_mine: [str] — items owned by the vault owner
+          - waiting_on: [{person, description}]
+          - other_commitments: [{person, description}]
+          - thread_updates: [{slug, body}] — evidence to append to each thread
+          - new_threads: [{slug, thesis}]
+          - concepts: [str] — concept slugs
+          - date: YYYY-MM-DD
+        """
+        return _do_structured_record(
+            config=config, source_type="meeting",
+            title=title, body=body, date=date,
+            attendees=attendees or [],
+            result_payload={
+                "summary": summary,
+                "attendees": attendees or [],
+                "decisions": decisions or [],
+                "action_items_mine": action_items_mine or [],
+                "waiting_on": waiting_on or [],
+                "other_commitments": other_commitments or [],
+                "thread_updates": thread_updates or [],
+                "new_threads": new_threads or [],
+                "concepts": concepts or [],
+            },
+        )
+
+    @mcp.tool()
+    def record_note(
+        title: str,
+        body: str,
+        summary: str,
+        action_items_mine: list[str] | None = None,
+        waiting_on: list[dict] | None = None,
+        thread_updates: list[dict] | None = None,
+        new_threads: list[dict] | None = None,
+        concepts: list[str] | None = None,
+    ) -> dict:
+        """Persist a short note Claude has already analyzed.
+
+        Same schema as record_meeting minus attendees/decisions/date.
+        """
+        return _do_structured_record(
+            config=config, source_type="note",
+            title=title, body=body, date=None, attendees=[],
+            result_payload={
+                "summary": summary,
+                "attendees": [],
+                "decisions": [],
+                "action_items_mine": action_items_mine or [],
+                "waiting_on": waiting_on or [],
+                "other_commitments": [],
+                "thread_updates": thread_updates or [],
+                "new_threads": new_threads or [],
+                "concepts": concepts or [],
+            },
+        )
+
+    @mcp.tool()
+    def record_doc(
+        title: str,
+        body: str,
+        summary: str,
+        attendees: list[dict] | None = None,
+        action_items_mine: list[str] | None = None,
+        waiting_on: list[dict] | None = None,
+        thread_updates: list[dict] | None = None,
+        new_threads: list[dict] | None = None,
+        concepts: list[str] | None = None,
+    ) -> dict:
+        """Persist a doc/strategy piece/brief that Claude has analyzed.
+
+        Docs may have authors/stakeholders (treated like attendees) and the
+        other fields from meetings, minus decisions and date.
+        """
+        return _do_structured_record(
+            config=config, source_type="doc",
+            title=title, body=body, date=None,
+            attendees=attendees or [],
+            result_payload={
+                "summary": summary,
+                "attendees": attendees or [],
+                "decisions": [],
+                "action_items_mine": action_items_mine or [],
+                "waiting_on": waiting_on or [],
+                "other_commitments": [],
+                "thread_updates": thread_updates or [],
+                "new_threads": new_threads or [],
+                "concepts": concepts or [],
+            },
+        )
+
+    # ---------- LEGACY: LLM-backed ingest (requires ANTHROPIC_API_KEY) ----------
+    #
+    # Kept so a user running their own API key can do batch ingest from the
+    # CLI or tools outside Claude Desktop. For the default chat workflow,
+    # use the structured record_* tools above instead — those don't need an
+    # API key because Claude Desktop does the analysis.
+
+    def _require_api_key() -> dict | None:
+        import os
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return {
+                "error": (
+                    "This tool runs its own LLM call and requires "
+                    "ANTHROPIC_API_KEY to be set on the server. For the "
+                    "no-API-key workflow, use `record_meeting` / "
+                    "`record_note` / `record_doc` (Claude Desktop does the "
+                    "analysis)."
+                )
+            }
+        return None
+
     @mcp.tool()
     def ingest_note(text: str, title: str | None = None) -> dict:
-        """File a pasted text as a short note and process it."""
+        """LEGACY: file a note with server-side LLM analysis.
+
+        Requires ANTHROPIC_API_KEY. Prefer `record_note` for the no-API-key
+        flow (Claude Desktop analyzes, this server just persists).
+        """
+        gate = _require_api_key()
+        if gate:
+            return gate
         safe_title = (title or f"note-{datetime.now().strftime('%Y%m%d-%H%M%S')}").strip()
         slug = _slugify(safe_title)
         dest = config.raw_notes / f"{slug}.md"
@@ -353,7 +659,14 @@ def build_server(vault_root: Path):
         date_str: str | None = None,
         attendees: list[str] | None = None,
     ) -> dict:
-        """File a pasted meeting note and process it."""
+        """LEGACY: file a meeting with server-side LLM analysis.
+
+        Requires ANTHROPIC_API_KEY. Prefer `record_meeting` for the
+        no-API-key flow.
+        """
+        gate = _require_api_key()
+        if gate:
+            return gate
         from deep_reader.sources.meeting import parse_meeting
         from deep_reader.markdown import format_frontmatter
         meta = parse_meeting(text)
@@ -393,87 +706,276 @@ def build_server(vault_root: Path):
 
     # ---------- Prompts ----------
     #
-    # Prompts are saved workflows surfaced by Claude Desktop as one-click
-    # options. They orchestrate calls across MCP servers — the Granola ones
-    # assume the user has also registered Granola's MCP server alongside this
-    # one.
+    # Prompts are saved workflows surfaced by Claude Desktop. In this
+    # architecture Claude does the reading, parsing, and summarization
+    # itself, then calls the structured `record_*` tools to persist. The
+    # server never makes LLM calls in this flow — Claude's own subscription
+    # covers all the model work.
+
+    ANALYZE_SCHEMA = """
+When you call `record_meeting`, pass these fields:
+- title (string)
+- date (YYYY-MM-DD, if known)
+- body (string) — the full original meeting text, unmodified
+- summary (string) — 2-4 sentences capturing outcome and decisions
+- attendees (list) — each {name, role?, email?}
+- decisions (list of strings)
+- action_items_mine (list of strings) — items owned by the vault owner ONLY.
+  Check `get_ingest_context().owner` for who that is; items owned by anyone
+  else belong in waiting_on or other_commitments, NOT here.
+- waiting_on (list) — each {person, description}. Items owed TO the vault
+  owner by another named person.
+- other_commitments (list) — each {person, description}. Items between other
+  parties that don't involve the vault owner.
+- thread_updates (list) — each {slug, body}. For every thread in
+  get_ingest_context().threads whose thesis this source meaningfully
+  advances, produce a one-sentence evidence entry (not a rewrite of the
+  thesis).
+- new_threads (list) — each {slug, thesis}. Only for genuinely recurring
+  themes introduced here that would be worth tracking across future sources.
+- concepts (list of strings) — concept slugs relevant to this source.
+""".strip()
 
     @mcp.prompt(
         description=(
-            "Fetch all of today's meetings from Granola and ingest each into "
-            "the knowledge base. Requires the Granola MCP server to also be "
-            "registered in Claude Desktop."
+            "Analyze a pasted meeting note and record it in the vault. "
+            "I'll paste the meeting content as my next message."
+        ),
+    )
+    def ingest_meeting_paste() -> str:
+        return (
+            "I'll paste a meeting note as my next message. Do these steps in "
+            "order:\n"
+            "1. Call `get_ingest_context()` so you know the vault owner, "
+            "active threads (with theses), and existing people.\n"
+            "2. Read the pasted content carefully.\n"
+            "3. Call `record_meeting(...)` with the structured analysis.\n"
+            "\n"
+            f"{ANALYZE_SCHEMA}\n"
+            "\n"
+            "Critical: before finalizing action_items_mine, compare each item "
+            "against the vault owner's name/aliases from get_ingest_context. "
+            "An item is 'mine' only if the OWNER is doing it. 'I'll send the "
+            "deck' said by the owner → mine. 'Jane will send the deck' → "
+            "waiting_on with person='Jane'.\n"
+            "\n"
+            "After recording, summarize what changed: attendees added, new "
+            "people, new action items on my list, threads advanced."
+        )
+
+    @mcp.prompt(
+        description=(
+            "Process every file in the inbox — read each, analyze it, and "
+            "record it in the vault."
+        ),
+    )
+    def ingest_inbox() -> str:
+        return (
+            "Process the vault inbox in order:\n"
+            "1. Call `list_inbox()`.\n"
+            "2. Call `get_ingest_context()` once — reuse it across every "
+            "file so your 'mine' classification stays consistent.\n"
+            "3. For each file:\n"
+            "   a. Call `read_inbox_file(filename)` to get the content and "
+            "suggested type.\n"
+            "   b. Pick the right record_* tool (record_meeting / "
+            "record_note / record_doc) based on the content and "
+            "suggested_type.\n"
+            "   c. Call that tool with your structured analysis.\n"
+            "   d. On success, call `move_inbox_file(filename, source_type)` "
+            "to archive the original.\n"
+            "4. At the end, give me a summary — how many files processed, "
+            "any that failed and why, top new action items.\n"
+            "\n"
+            f"{ANALYZE_SCHEMA}"
+        )
+
+    @mcp.prompt(
+        description=(
+            "Fetch today's meetings from Granola and record each in the "
+            "vault. Requires Granola's MCP server to also be registered."
         ),
     )
     def ingest_granola_today() -> str:
         return (
-            "Use the Granola MCP tools to list every meeting from today, then "
-            "for each meeting call this server's `ingest_meeting` tool with "
-            "the meeting's full content, title, date, and attendee list. "
-            "After ingesting, summarize what you added: how many meetings, "
-            "who was in them, and any new action items that ended up on my "
-            "list. If Granola doesn't return anything for today, say so "
-            "rather than inventing meetings."
+            "Pull today's Granola meetings and record them:\n"
+            "1. Call `get_ingest_context()` for owner, threads, people.\n"
+            "2. Use the Granola MCP tools to list every meeting from today.\n"
+            "3. For each meeting:\n"
+            "   a. Get its full content, title, date, and attendee list "
+            "from Granola's tools.\n"
+            "   b. Analyze it against the ingest context.\n"
+            "   c. Call `record_meeting(...)` with the structured result.\n"
+            "4. Summarize what was added.\n"
+            "If Granola returns nothing for today, say so — don't invent.\n"
+            "\n"
+            f"{ANALYZE_SCHEMA}"
         )
 
     @mcp.prompt(
         description=(
-            "Fetch meetings from Granola for a given date range and ingest "
-            "each. Args: start_date and end_date as YYYY-MM-DD. Requires the "
-            "Granola MCP server to also be registered in Claude Desktop."
+            "Fetch Granola meetings for a date range and record each. Args: "
+            "start_date, end_date (YYYY-MM-DD)."
         ),
     )
     def ingest_granola_range(start_date: str, end_date: str) -> str:
         return (
-            f"Use the Granola MCP tools to list every meeting between "
-            f"{start_date} and {end_date} (inclusive). For each meeting, "
-            f"call this server's `ingest_meeting` tool with the meeting's "
-            f"full content, title, date, and attendee list. Skip any meeting "
-            f"that appears to already be in the vault (check via `search` "
-            f"first if unsure). After ingesting, summarize: how many were "
-            f"added, who's been most active in that range, and the top new "
-            f"action items that landed on my list."
+            f"Pull Granola meetings between {start_date} and {end_date} "
+            f"(inclusive) and record them:\n"
+            "1. Call `get_ingest_context()`.\n"
+            "2. Use Granola's tools to list meetings in the range.\n"
+            "3. For each, check if it's already in the vault (call "
+            "`search(query=meeting_title)`). Skip any that match.\n"
+            "4. For new ones, analyze and call `record_meeting(...)`.\n"
+            "5. Summarize additions.\n"
+            "\n"
+            f"{ANALYZE_SCHEMA}"
         )
 
     @mcp.prompt(
         description=(
-            "Fetch the last 7 days of Granola meetings and ingest any not "
-            "already present. Good for a weekly catchup."
+            "Weekly catchup — fetch last 7 days of Granola meetings and "
+            "record any not already in the vault."
         ),
     )
     def ingest_granola_week() -> str:
         return (
-            "Use the Granola MCP tools to list every meeting from the past 7 "
-            "days (today minus 6, through today). For each meeting, check "
-            "whether we already have it — call this server's `search` tool "
-            "with the meeting title first. If not found, call `ingest_meeting` "
-            "with the meeting content, title, date, and attendees. At the end, "
-            "give me a short weekly recap: who I met with, recurring themes "
-            "you noticed across meetings, new people added to the vault, and "
-            "any follow-ups that need my attention."
+            "Run a weekly catchup from Granola:\n"
+            "1. Call `get_ingest_context()`.\n"
+            "2. List Granola meetings from the past 7 days.\n"
+            "3. For each, call `search(query=meeting_title)` to check for "
+            "duplicates. Skip matches.\n"
+            "4. For new meetings, analyze and `record_meeting(...)`.\n"
+            "5. Give me a weekly digest: who I met with most, recurring "
+            "themes (reference any threads that advanced), top new items.\n"
+            "\n"
+            f"{ANALYZE_SCHEMA}"
         )
 
     @mcp.prompt(
         description=(
-            "Catch me up — summarize what's changed in my vault since we last "
-            "talked: open action items, new people, recent meetings."
+            "Catch me up — brief on what's changed in the vault: open "
+            "items, new people, recent sources."
         ),
     )
     def catch_me_up() -> str:
         return (
-            "Read the `vault://summary` resource and the `vault://action_items` "
-            "resource. Call `list_action_items(status='open')` and "
-            "`list_waiting_on(status='open')`. Give me a concise brief "
-            "(no more than ~200 words) covering: my top open action items "
-            "ranked by how old they are, anything I'm waiting on that's been "
-            "sitting too long, the most recent 3-5 sources in the vault, "
-            "and one thing you think I should do next."
+            "Give me a short brief (~200 words max). Steps:\n"
+            "1. Read the `vault://summary` resource.\n"
+            "2. Call `list_action_items(status='open')` and "
+            "`list_waiting_on(status='open')`.\n"
+            "3. Report: my top open items ranked by age, anything I'm "
+            "waiting on that's been sitting too long, the 3-5 most recent "
+            "sources, and one concrete thing to do next."
         )
 
     return mcp
 
 
 # ---------- helpers ----------
+
+
+def _do_structured_record(
+    config: Config,
+    source_type: str,
+    title: str,
+    body: str,
+    date: str | None,
+    attendees: list[str] | list[dict],
+    result_payload: dict,
+) -> dict:
+    """Shared implementation for record_meeting / record_note / record_doc.
+
+    No LLM. Writes raw file, builds a Source, seeds SourceState threads from
+    the global pool, then calls reader.record_structured_source() to persist
+    everything (overview, detail page, people, action items, threads).
+    """
+    from datetime import date as _date
+    from deep_reader.markdown import format_frontmatter
+    from deep_reader.reader import record_structured_source
+    from deep_reader.sources.base import Source, SourceType
+    from deep_reader.state import GlobalState, SourceState
+    from deep_reader.wiki import Wiki
+
+    type_enum = {
+        "meeting": SourceType.MEETING,
+        "note": SourceType.NOTE,
+        "doc": SourceType.DOC,
+    }[source_type]
+
+    # Parse date string
+    meeting_date = None
+    if date:
+        try:
+            parts = date.split("-")
+            meeting_date = _date(int(parts[0]), int(parts[1]), int(parts[2]))
+        except Exception:
+            pass
+
+    # Extract attendee names for the Source
+    attendee_names: list[str] = []
+    for a in attendees or []:
+        if isinstance(a, str):
+            attendee_names.append(a)
+        elif isinstance(a, dict) and a.get("name"):
+            attendee_names.append(a["name"])
+
+    # Write raw body to disk with frontmatter
+    fm: dict = {"title": title, "type": source_type}
+    if date:
+        fm["date"] = date
+    if attendee_names:
+        fm["attendees"] = attendee_names
+
+    slug = _slugify(title) or "untitled"
+    raw_dir = _raw_dir_for(config, source_type)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{date}-{slug}.md" if date and source_type == "meeting" else f"{slug}.md"
+    raw_path = raw_dir / filename
+    # If the file already exists (re-record), rename with a suffix
+    if raw_path.exists():
+        import time
+        filename = f"{raw_path.stem}-{int(time.time())}{raw_path.suffix}"
+        raw_path = raw_dir / filename
+    raw_path.write_text(format_frontmatter(fm) + body)
+
+    # Build Source
+    source = Source(
+        path=raw_path,
+        title=title,
+        author=source_type,
+        source_type=type_enum,
+        meeting_date=meeting_date,
+        attendees=attendee_names,
+    )
+
+    # Load state and set up SourceState, seeding threads from global
+    state = GlobalState.load(config.state_file)
+    wiki = Wiki(config)
+    wiki.init_source(source.slug, source.title, source.author, source.source_type.value)
+
+    if source.slug not in state.sources:
+        state.sources[source.slug] = SourceState(
+            source_slug=source.slug,
+            source_path=str(source.path),
+            threads=list(state.global_threads),
+            source_type=source_type,
+            meeting_date=date,
+            attendees=attendee_names,
+        )
+    source_state = state.sources[source.slug]
+
+    # Ensure result_payload has expected shape
+    result_payload.setdefault("full_text", body)
+
+    summary = record_structured_source(
+        source, result_payload, source_state, state, wiki, config
+    )
+    summary["raw_file"] = str(raw_path.relative_to(config.vault_root))
+    return summary
+
+
+
 
 def _dump_action(a, state: GlobalState | None = None) -> dict:
     d = {

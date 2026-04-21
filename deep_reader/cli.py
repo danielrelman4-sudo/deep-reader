@@ -717,6 +717,93 @@ def sync_recap_cmd(ctx, target_date):
     run_sync_recap(ctx.obj["config"], td)
 
 
+@main.command()
+@click.argument("source_slug")
+@click.option("--yes", is_flag=True, help="Skip confirmation")
+@click.pass_context
+def forget(ctx, source_slug, yes):
+    """Remove a source from the vault — its page, state, and any action items / thread evidence tied to it.
+
+    Doesn't delete people (they might appear in other sources) or threads
+    (they might span multiple sources). Removes action_items whose source
+    is this slug, and removes thread evidence entries that reference it.
+    """
+    from deep_reader.state import GlobalState
+    from deep_reader.thread_utils import extract_section, assemble_thread
+    from deep_reader.wiki import Wiki, render_action_items, render_waiting_on
+    import shutil, re
+
+    config = ctx.obj["config"]
+    state = GlobalState.load(config.state_file)
+    wiki = Wiki(config)
+
+    if source_slug not in state.sources:
+        console.print(f"[red]No source with slug:[/red] {source_slug}")
+        console.print("[dim]Known sources:[/dim]")
+        for s in sorted(state.sources.keys()):
+            console.print(f"  {s}")
+        return
+
+    if not yes:
+        click.confirm(
+            f"Forget '{source_slug}'? This removes its wiki page, state, and action items. "
+            "The raw file in raw/ is preserved.",
+            abort=True,
+        )
+
+    # Remove wiki source directory
+    src_dir = wiki.source_dir(source_slug)
+    if src_dir.exists():
+        shutil.rmtree(src_dir)
+
+    # Remove action items attributed to this source
+    removed_actions = [a for a in state.action_items if a.source == source_slug]
+    state.action_items = [a for a in state.action_items if a.source != source_slug]
+
+    # Scrub thread evidence entries referencing this source
+    evidence_ref = f"[[{source_slug}/"
+    threads_touched = []
+    for thread_path in config.wiki_threads.glob("*.md"):
+        content = thread_path.read_text()
+        evidence = extract_section(content, "Evidence")
+        if evidence_ref not in evidence:
+            continue
+        new_lines = [
+            line for line in evidence.split("\n")
+            if evidence_ref not in line
+        ]
+        new_evidence = "\n".join(new_lines).strip() or "(no evidence yet)"
+        thesis = extract_section(content, "Thesis")
+        status = extract_section(content, "Status")
+        thread_path.write_text(assemble_thread(thesis, new_evidence, status))
+        threads_touched.append(thread_path.stem)
+
+    # Remove from source state
+    del state.sources[source_slug]
+    # Remove from any person's appearances
+    for p in state.people.values():
+        if source_slug in p.appearances:
+            p.appearances.remove(source_slug)
+
+    state.save(config.state_file)
+
+    # Re-render central lists
+    render_action_items(wiki, state)
+    render_waiting_on(wiki, state)
+
+    console.print(f"[green]✓[/green] Forgot [bold]{source_slug}[/bold]")
+    console.print(
+        f"  Removed {len(removed_actions)} action item(s), "
+        f"scrubbed {len(threads_touched)} thread(s)"
+    )
+    if threads_touched:
+        console.print(f"  [dim]Threads: {', '.join(threads_touched)}[/dim]")
+    console.print(
+        f"  [dim]Raw file preserved — delete manually from "
+        f"{config.vault_root}/raw if desired.[/dim]"
+    )
+
+
 @main.command(name="init-vault")
 @click.option("--name", prompt="Your full name", help="Vault owner name")
 @click.option("--email", prompt="Your email", help="Vault owner email")

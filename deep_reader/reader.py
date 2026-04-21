@@ -199,10 +199,14 @@ def _run_fast_path(
     config: Config,
     verbose: bool,
 ) -> None:
-    """Single-call pipeline for short sources (meetings, notes, short docs)."""
-    from deep_reader.steps import people as people_step
-    from deep_reader.steps import actions as actions_step
+    """Single-call pipeline for short sources (meetings, notes, short docs).
 
+    This is the "with-LLM" path: we run the fast_path prompt ourselves, then
+    hand the parsed result to record_structured_source(). The MCP `record_*`
+    tools call record_structured_source() directly with data already parsed
+    by Claude Desktop — so no LLM access is required on the server side in
+    that flow.
+    """
     console.print(
         f"\n[bold]Reading:[/bold] {source.title} "
         f"[dim]({source.source_type.value}, ~{source.word_count:,} words, fast path)[/dim]\n"
@@ -210,43 +214,81 @@ def _run_fast_path(
 
     with console.status("[dim]Analyzing…[/dim]"):
         known_people = [p.name for p in state.people.values()]
-        # Load each active thread's thesis (truncated inside build_prompt) so
-        # the LLM can make real judgments about which threads this source
-        # advances — not just pattern-match on slugs.
         threads_for_prompt = _load_thread_theses(wiki, source_state.threads)
         result = fast_path.run(
             source, state.owner, threads_for_prompt, known_people, llm
         )
 
-    # Write the detail page (single chunk at index 0 for fast-path sources).
+    summary = record_structured_source(
+        source, result, source_state, state, wiki, config
+    )
+
+    if verbose:
+        console.print(
+            f"  [green]✓[/green] {len(result['attendees'])} people, "
+            f"{len(result['action_items_mine'])} of mine + "
+            f"{len(result['waiting_on'])} waiting, "
+            f"{len(summary['threads_updated'])} threads updated, "
+            f"{len(summary['threads_created'])} new threads"
+        )
+    console.print(f"\n[bold green]✓[/bold green] {source.title}")
+
+
+def record_structured_source(
+    source: Source,
+    result: dict,
+    source_state: SourceState,
+    state: GlobalState,
+    wiki: Wiki,
+    config: Config,
+) -> dict:
+    """Persist a parsed fast-path result to the vault. No LLM calls.
+
+    `result` matches the shape returned by fast_path.parse_response():
+        summary, attendees, decisions, action_items_mine, waiting_on,
+        other_commitments, thread_updates, new_threads, concepts, full_text?
+
+    Shared between the fast-path CLI flow (LLM parses then calls this) and
+    the MCP `record_*` tools (Claude parses then calls this).
+
+    Returns a summary dict with what changed for caller reporting.
+    """
+    from deep_reader.steps import people as people_step
+    from deep_reader.steps import actions as actions_step
+    from deep_reader.wiki import render_action_items, render_waiting_on
+
+    # Detail page (chunk 0)
     page = _render_fast_path_page(source, result)
     wiki.write_chunk_page(source.slug, 0, page)
+
     # Overview = summary for short sources.
     overview = _render_fast_path_overview(source, result)
     wiki.write_overview(source.slug, overview)
 
-    # Apply thread updates
+    # Thread updates + new threads
     threads_updated, threads_created = _apply_fast_path_threads(
         source, result, source_state, state, wiki
     )
 
-    # People extraction + alias resolution
-    touched = people_step.ingest_fast_path_attendees(state, source, result["attendees"])
+    # People
+    touched = people_step.ingest_fast_path_attendees(
+        state, source, result.get("attendees", [])
+    )
 
     # Action items
     actions_step.ingest_fast_path_actions(
         state, source,
-        mine=result["action_items_mine"],
-        waiting_on=result["waiting_on"],
-        other=result["other_commitments"],
+        mine=result.get("action_items_mine", []),
+        waiting_on=result.get("waiting_on", []),
+        other=result.get("other_commitments", []),
     )
 
-    # Render the central lists after state update
-    from deep_reader.wiki import render_action_items, render_waiting_on
+    # Render central lists
     render_action_items(wiki, state)
     render_waiting_on(wiki, state)
 
-    # Render people pages — touched + anyone with new waiting-on items.
+    # Render people pages — touched + anyone with new waiting-on items +
+    # always refresh the owner's page (their action-item list likely changed).
     waiting_owners = {
         a.owner for a in state.action_items
         if a.category == "waiting_on" and a.source == source.slug
@@ -255,7 +297,6 @@ def _run_fast_path(
     for slug in waiting_owners:
         if slug in state.people and slug not in to_render:
             to_render[slug] = state.people[slug]
-    # Always refresh the owner's own page since My Action Items may have changed.
     for p in state.people.values():
         if state.owner.matches(p.name) or state.owner.matches(p.email or ""):
             to_render[p.slug] = p
@@ -263,15 +304,24 @@ def _run_fast_path(
         people_step.render_person_page(person, state, config.wiki_people)
     people_step.render_people_index(state, config.wiki_indexes / "people.md")
 
-    # Record state — single chunk, all steps marked complete.
+    # Mark source state complete — single chunk, all steps.
     source_state.total_chunks = 1
     if 0 not in source_state.chunks:
         source_state.chunks[0] = ChunkState(chunk_index=0)
     for step in StepName:
         state.mark_step_complete(source.slug, 0, step)
-
     source_state.completed_at = datetime.now()
     state.save(config.state_file)
+
+    return {
+        "source_slug": source.slug,
+        "attendees_count": len(result.get("attendees", [])),
+        "action_items_mine_count": len(result.get("action_items_mine", [])),
+        "waiting_on_count": len(result.get("waiting_on", [])),
+        "threads_updated": threads_updated,
+        "threads_created": threads_created,
+        "people_touched": [p.name for p in touched],
+    }
 
     if verbose:
         console.print(

@@ -44,9 +44,13 @@ deep-reader --vault vault people list
 deep-reader --vault vault people show "Jane Smith"
 ```
 
-## Chat via Claude Desktop (MCP)
+## Chat via Claude Desktop (MCP) — the primary workflow
 
 `deep-reader mcp` starts an MCP server that exposes your vault as resources (for reading) and tools (for actions).
+
+**Key design choice**: The MCP flow does not require an Anthropic API key on the server. Claude Desktop (using your own Claude subscription) does all the LLM work — reading content, parsing it, deciding what to link. The MCP server is a structured data store: it accepts analyzed results through `record_meeting` / `record_note` / `record_doc` and persists them.
+
+Only the legacy `ingest_*` tools (and the `deep-reader watch` / CLI read commands) require `ANTHROPIC_API_KEY`. Those are kept for batch / CLI use but are not needed for the day-to-day chat workflow.
 
 ### 1. Install the MCP extra if you haven't
 
@@ -86,20 +90,32 @@ Ask Claude things like:
 
 ### Available tools
 
+**Primary workflow (no API key — Claude Desktop does the analysis):**
+
 | Tool | Purpose |
 |---|---|
+| `get_ingest_context` | Returns vault owner + active threads (with theses) + known people. Call this first before analyzing a source. |
+| `read_inbox_file(filename)` | Returns extracted text of a file in `vault/inbox/` (PDF/docx/md/txt) |
+| `record_meeting(...)` | Persist a meeting Claude has analyzed — accepts title, date, body, summary, attendees, decisions, action items, waiting-on, thread updates, new threads, concepts |
+| `record_note(...)` | Same for short notes |
+| `record_doc(...)` | Same for internal docs/briefs |
+| `move_inbox_file(filename, type)` | Archive a processed inbox file into `raw/{type}/` |
 | `search` | Cross-entity search (sources, threads, concepts, people, action items) |
-| `list_action_items` | Your to-do list (category=mine) |
-| `list_waiting_on` | Items owed by others, optionally filtered by person |
-| `add_action_item` / `add_waiting_on` | Create new items |
-| `close_action_item` | Mark done |
-| `list_people` / `get_person` | People directory |
-| `merge_people` | Consolidate duplicate people records |
-| `list_inbox` / `ingest_file` | Pick up files dropped in `vault/inbox/` |
-| `ingest_file_bytes` | Inline base64 fallback for file ingest |
-| `ingest_note` / `ingest_meeting` | File pasted content directly |
-| `recap_prep` | Generate context for the daily-recap skill |
-| `sync_recap` | Pull action items out of a written recap |
+| `list_action_items` / `list_waiting_on` | Your to-do list / items owed by others |
+| `add_action_item` / `add_waiting_on` / `close_action_item` | Action-item CRUD |
+| `list_people` / `get_person` / `merge_people` | People directory |
+| `forget_source(slug)` | Remove a source's page, state, action items, and thread evidence |
+| `recap_prep` / `sync_recap` | Daily-recap skill integration |
+| `list_inbox` | See what's in the inbox waiting to be processed |
+
+**Legacy tools (require `ANTHROPIC_API_KEY` on the server):**
+
+| Tool | Purpose |
+|---|---|
+| `ingest_meeting` / `ingest_note` | Server-side LLM analyzes and persists in one call |
+| `ingest_file` / `ingest_file_bytes` | Same for files |
+
+Prefer the `record_*` tools — the legacy tools exist only for users running their own API key / CLI batch flows.
 
 ### Available resources
 
@@ -107,11 +123,13 @@ Ask Claude things like:
 
 ### Available prompts (one-click workflows)
 
-Claude Desktop surfaces MCP prompts as saved workflows:
+Claude Desktop surfaces MCP prompts as saved workflows. All prompts drive Claude through the no-API-key flow: `get_ingest_context` → analyze → `record_*` tools.
 
 | Prompt | What it does |
 |---|---|
-| `ingest_granola_today` | Pulls today's meetings from Granola MCP and ingests each one |
+| `ingest_meeting_paste` | Paste a meeting into chat next; Claude analyzes and records it |
+| `ingest_inbox` | Process every file in `vault/inbox/` — reads each, analyzes, records, archives |
+| `ingest_granola_today` | Pulls today's meetings from Granola MCP and records each one |
 | `ingest_granola_week` | Last 7 days; skips anything already in the vault |
 | `ingest_granola_range(start, end)` | Arbitrary date range |
 | `catch_me_up` | Reads state and returns a concise brief of open items + recent activity |
