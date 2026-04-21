@@ -153,23 +153,32 @@ def ingest_fast_path_actions(
     waiting_on: list[dict],
     other: list[dict],
 ) -> None:
-    """Merge a fast_path result's action items into state."""
+    """Merge a fast_path result's action items into state.
+
+    Defensive: entries that aren't dicts or are missing required keys are
+    skipped rather than crashing the ingest. FastMCP's TypedDict validation
+    should prevent this at the tool boundary, but LLM-authored payloads
+    occasionally show up with surprising shapes.
+    """
     for description in mine or []:
-        if description:
-            add_mine(state, description, source.slug)
+        if isinstance(description, str) and description.strip():
+            add_mine(state, description.strip(), source.slug)
 
     for item in waiting_on or []:
+        if not isinstance(item, dict):
+            continue
         person = (item.get("person") or "").strip()
         desc = (item.get("description") or "").strip()
         if not person or not desc:
             continue
-        # If the person named is actually the vault owner, reclassify as mine.
         if state.owner.matches(person):
             add_mine(state, desc, source.slug)
             continue
         add_waiting_on(state, desc, person, source.slug)
 
     for item in other or []:
+        if not isinstance(item, dict):
+            continue
         person = (item.get("person") or "").strip()
         desc = (item.get("description") or "").strip()
         if not person or not desc:

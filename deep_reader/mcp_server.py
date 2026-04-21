@@ -41,12 +41,50 @@ import json
 import sys
 from datetime import date, datetime
 from pathlib import Path
+from typing_extensions import NotRequired, TypedDict
 
 from deep_reader.config import Config, get_config
 from deep_reader.llm import claude_code_llm
 from deep_reader.search import search as search_fn
 from deep_reader.state import GlobalState
 from deep_reader.wiki import Wiki
+
+
+# ---------- Nested structured types ----------
+#
+# Declared as TypedDicts so FastMCP's schema generator produces proper JSON
+# Schema for each record_* tool. This gives Claude Desktop the exact shape it
+# needs before calling (no guessing from docstrings) and turns validation
+# errors into "expected key 'body' in thread_updates[0]" instead of the
+# useless "KeyError: 'body'" that surfaced from downstream.
+
+class Attendee(TypedDict):
+    """Meeting attendee or doc author."""
+    name: str
+    role: NotRequired[str]
+    email: NotRequired[str]
+
+
+class ThreadUpdate(TypedDict):
+    """Evidence to append to an existing thread.
+
+    `slug` must match an existing thread (check via get_ingest_context).
+    `body` is a ONE-sentence evidence entry, not a rewrite of the thesis.
+    """
+    slug: str
+    body: str
+
+
+class NewThread(TypedDict):
+    """A new thread to create for a recurring theme worth tracking."""
+    slug: str
+    thesis: str
+
+
+class PersonItem(TypedDict):
+    """An item attributed to a named person (waiting_on / other_commitments)."""
+    person: str
+    description: str
 
 
 def build_server(vault_root: Path):
@@ -521,26 +559,26 @@ def build_server(vault_root: Path):
         title: str,
         body: str,
         summary: str,
-        attendees: list[dict] | None = None,
+        attendees: list[Attendee] | None = None,
         decisions: list[str] | None = None,
         action_items_mine: list[str] | None = None,
-        waiting_on: list[dict] | None = None,
-        other_commitments: list[dict] | None = None,
-        thread_updates: list[dict] | None = None,
-        new_threads: list[dict] | None = None,
+        waiting_on: list[PersonItem] | None = None,
+        other_commitments: list[PersonItem] | None = None,
+        thread_updates: list[ThreadUpdate] | None = None,
+        new_threads: list[NewThread] | None = None,
         concepts: list[str] | None = None,
         date: str | None = None,
     ) -> dict:
         """Persist a meeting Claude has already analyzed.
 
-        Schema expectations:
+        Nested types (see schema in the tool's inputSchema):
           - attendees: [{name, role?, email?}]
           - decisions: [str]
           - action_items_mine: [str] — items owned by the vault owner
-          - waiting_on: [{person, description}]
-          - other_commitments: [{person, description}]
-          - thread_updates: [{slug, body}] — evidence to append to each thread
-          - new_threads: [{slug, thesis}]
+          - waiting_on: [{person, description}] — owed TO the owner
+          - other_commitments: [{person, description}] — between other parties
+          - thread_updates: [{slug, body}] — existing-thread evidence
+          - new_threads: [{slug, thesis}] — brand-new threads
           - concepts: [str] — concept slugs
           - date: YYYY-MM-DD
         """
@@ -567,14 +605,21 @@ def build_server(vault_root: Path):
         body: str,
         summary: str,
         action_items_mine: list[str] | None = None,
-        waiting_on: list[dict] | None = None,
-        thread_updates: list[dict] | None = None,
-        new_threads: list[dict] | None = None,
+        waiting_on: list[PersonItem] | None = None,
+        thread_updates: list[ThreadUpdate] | None = None,
+        new_threads: list[NewThread] | None = None,
         concepts: list[str] | None = None,
     ) -> dict:
         """Persist a short note Claude has already analyzed.
 
-        Same schema as record_meeting minus attendees/decisions/date.
+        Nested types (see schema in the tool's inputSchema):
+          - action_items_mine: [str] — items owned by the vault owner
+          - waiting_on: [{person, description}] — owed TO the owner
+          - thread_updates: [{slug, body}] — existing-thread evidence
+          - new_threads: [{slug, thesis}] — brand-new threads
+          - concepts: [str] — concept slugs
+
+        Notes never have attendees, decisions, or an explicit date.
         """
         return _do_structured_record(
             config=config, source_type="note",
@@ -597,24 +642,30 @@ def build_server(vault_root: Path):
         title: str,
         body: str,
         summary: str,
-        attendees: list[dict] | None = None,
+        attendees: list[Attendee] | None = None,
         action_items_mine: list[str] | None = None,
-        waiting_on: list[dict] | None = None,
-        thread_updates: list[dict] | None = None,
-        new_threads: list[dict] | None = None,
+        waiting_on: list[PersonItem] | None = None,
+        thread_updates: list[ThreadUpdate] | None = None,
+        new_threads: list[NewThread] | None = None,
         concepts: list[str] | None = None,
     ) -> dict:
         """Persist a doc / strategy brief / slide deck / competitive report.
 
-        Unlike meetings, most docs have no people attached — pass attendees=[]
-        (or omit it) rather than inventing authors. Same for action items —
-        pass [] if the doc doesn't assign work. The doc still gets indexed,
-        summarized, and connected to threads + concepts regardless.
+        Nested types (see schema in the tool's inputSchema):
+          - attendees: [{name, role?, email?}] — pass [] for docs with no
+            named author or participant list; don't invent authors.
+          - action_items_mine: [str] — items owned by the vault owner;
+            pass [] if the doc doesn't assign work.
+          - waiting_on: [{person, description}] — owed TO the owner
+          - thread_updates: [{slug, body}] — existing-thread evidence.
+            NOT optional-in-spirit for docs: if the doc connects to any
+            existing thread, this is how it shows up on those threads.
+          - new_threads: [{slug, thesis}] — brand-new threads to track
+          - concepts: [str] — concept slugs; almost always worth populating
 
-        thread_updates, new_threads, and concepts still matter for docs and
-        should NOT be empty if the doc relates to existing work or
-        introduces a tracked theme. Those are how docs connect to the rest
-        of the vault.
+        The doc still gets indexed, summarized, and searchable even with
+        empty attendees / action items. thread_updates, new_threads, and
+        concepts are how docs connect to the rest of the vault.
         """
         return _do_structured_record(
             config=config, source_type="doc",

@@ -416,35 +416,48 @@ def _apply_fast_path_threads(
     global_state: GlobalState,
     wiki: Wiki,
 ) -> tuple[list[str], list[str]]:
-    """Apply thread_updates and new_threads from a fast-path result."""
+    """Apply thread_updates and new_threads from a fast-path result.
+
+    Defensive on shape — malformed entries (missing slug, missing body,
+    missing thesis) are skipped rather than crashing the whole ingest.
+    FastMCP's TypedDict validation should catch these at the tool boundary,
+    but an LLM-produced payload is the universe's most entitled dict.
+    """
     threads_updated: list[str] = []
     threads_created: list[str] = []
 
-    for update in result.get("thread_updates", []):
-        slug = update["slug"]
+    for update in result.get("thread_updates") or []:
+        if not isinstance(update, dict):
+            continue
+        slug = (update.get("slug") or "").strip()
+        body = (update.get("body") or "").strip()
+        if not slug or not body:
+            continue
         if slug not in source_state.threads and slug not in global_state.global_threads:
-            # Thread mentioned by model but not in our list — skip; model may have
-            # hallucinated. New threads must come through the "New Threads" section.
+            # Thread mentioned but not in our list — model hallucination, skip.
             continue
         existing = wiki.read_thread(slug) or ""
         existing_evidence = extract_section(existing, "Evidence")
         thesis = extract_section(existing, "Thesis") or existing
         status = extract_section(existing, "Status")
-        new_entry = f"- [[{source.slug}/chunk-001]]: {update['body']}"
+        new_entry = f"- [[{source.slug}/chunk-001]]: {body}"
         combined = append_evidence(existing_evidence, new_entry)
         wiki.write_thread(slug, assemble_thread(thesis, combined, status))
         threads_updated.append(slug)
         if slug not in source_state.threads:
             source_state.threads.append(slug)
 
-    for new_thread in result.get("new_threads", []):
-        slug = new_thread["slug"]
-        if not slug:
+    for new_thread in result.get("new_threads") or []:
+        if not isinstance(new_thread, dict):
+            continue
+        slug = (new_thread.get("slug") or "").strip()
+        thesis = (new_thread.get("thesis") or "").strip()
+        if not slug or not thesis:
             continue
         if slug in source_state.threads or slug in global_state.global_threads:
             continue
         content = assemble_thread(
-            new_thread["thesis"],
+            thesis,
             f"- [[{source.slug}/chunk-001]]: introduced here",
             "",
         )

@@ -142,6 +142,8 @@ def ingest_fast_path_attendees(
         people.append(p)
 
     for a in attendees or []:
+        if not isinstance(a, dict):
+            continue
         name = (a.get("name") or "").strip()
         if not name:
             continue
