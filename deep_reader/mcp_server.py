@@ -779,7 +779,7 @@ When you call `record_meeting`, pass these fields:
     @mcp.prompt(
         description=(
             "Process every file in the inbox — read each, analyze it, and "
-            "record it in the vault."
+            "record it in the vault. Skips anything already present."
         ),
     )
     def ingest_inbox() -> str:
@@ -791,14 +791,22 @@ When you call `record_meeting`, pass these fields:
             "3. For each file:\n"
             "   a. Call `read_inbox_file(filename)` to get the content and "
             "suggested type.\n"
-            "   b. Pick the right record_* tool (record_meeting / "
-            "record_note / record_doc) based on the content and "
-            "suggested_type.\n"
-            "   c. Call that tool with your structured analysis.\n"
-            "   d. On success, call `move_inbox_file(filename, source_type)` "
-            "to archive the original.\n"
-            "4. At the end, give me a summary — how many files processed, "
-            "any that failed and why, top new action items.\n"
+            "   b. **Dedup check.** Derive a likely title from the content "
+            "or filename, then call `search(query=<title or distinctive "
+            "phrase>)`. If the first result's source slug looks like a "
+            "match (same title, same date), skip this file — call "
+            "`move_inbox_file(filename, source_type)` with the existing "
+            "source type and report it as 'already in vault'. Do NOT call "
+            "record_* for files you believe are duplicates.\n"
+            "   c. For new files: pick the right record_* tool "
+            "(record_meeting / record_note / record_doc) based on content "
+            "and the suggested_type hint from read_inbox_file.\n"
+            "   d. Call that tool with your structured analysis.\n"
+            "   e. On success, call `move_inbox_file(filename, "
+            "source_type)` to archive the original.\n"
+            "4. At the end, give me a summary — how many were new, how "
+            "many skipped as duplicates, any that failed and why, and the "
+            "top new action items on my list.\n"
             "\n"
             f"{ANALYZE_SCHEMA}"
         )
