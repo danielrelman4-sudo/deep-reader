@@ -39,10 +39,22 @@ def read_source(
     wiki.init_source(source.slug, source.title, source.author, source.source_type.value)
 
     if source.slug not in state.sources:
+        # Seed the new source's thread list from the global pool so CONNECT
+        # (full loop) and fast_path (short sources) can extend threads from
+        # earlier sources rather than treating each source as an island.
+        # Without this, source B would never link to source A's threads.
         state.sources[source.slug] = SourceState(
             source_slug=source.slug,
             source_path=str(source.path),
+            threads=list(state.global_threads),
         )
+    else:
+        # Existing source being resumed — reconcile in case global_threads
+        # grew since last run (e.g., another source created threads in between).
+        existing = state.sources[source.slug]
+        for t in state.global_threads:
+            if t not in existing.threads:
+                existing.threads.append(t)
 
     source_state = state.sources[source.slug]
     source_state.source_type = source.source_type.value
