@@ -23,12 +23,28 @@ def _load_template() -> str:
 def build_prompt(
     source: Source,
     owner: VaultOwner,
-    thread_names: list[str],
+    threads: list[dict],
     known_people: list[str],
 ) -> str:
+    """Build the fast_path prompt.
+
+    `threads` is a list of `{"slug": ..., "thesis": ...}` records (thesis
+    may be empty). The thesis is shown alongside the slug so the LLM can
+    meaningfully decide whether the current source advances an existing
+    thread — without this, the model only sees slugs and has to guess.
+    """
     from deep_reader.steps import safe_format
 
-    thread_list = "\n".join(f"- {t}" for t in thread_names) if thread_names else "(no threads yet)"
+    if threads:
+        lines = []
+        for t in threads:
+            thesis = (t.get("thesis") or "").strip()
+            snippet = _thesis_snippet(thesis) if thesis else "(no thesis yet)"
+            lines.append(f"- **{t['slug']}** — {snippet}")
+        thread_list = "\n".join(lines)
+    else:
+        thread_list = "(no threads yet)"
+
     people_list = "\n".join(f"- {p}" for p in known_people[:50]) if known_people else "(no people tracked yet)"
     aliases = ", ".join(owner.aliases) if owner.aliases else "(none)"
     source_date = (
@@ -51,6 +67,24 @@ def build_prompt(
         known_people=people_list,
         body=source.text,
     )
+
+
+def _thesis_snippet(thesis: str, max_chars: int = 220) -> str:
+    """Compact a thread's thesis to a single sentence / clause for prompt use.
+
+    Thesis sections are nominally 200-300 words by convention; for prompt
+    framing we only need enough to signal what the thread is *about*.
+    """
+    # Strip markdown headers/formatting noise, take first sentence.
+    cleaned = thesis.replace("\n", " ").strip()
+    # First sentence boundary
+    for sep in [". ", "? ", "! "]:
+        idx = cleaned.find(sep)
+        if 40 <= idx <= max_chars:
+            return cleaned[: idx + 1]
+    if len(cleaned) > max_chars:
+        return cleaned[: max_chars - 1].rsplit(" ", 1)[0] + "…"
+    return cleaned
 
 
 def parse_response(response: str) -> dict:
@@ -85,12 +119,15 @@ def parse_response(response: str) -> dict:
 def run(
     source: Source,
     owner: VaultOwner,
-    thread_names: list[str],
+    threads: list[dict],
     known_people: list[str],
     llm: Callable[[str], str],
 ) -> dict:
-    """Run the fast path end-to-end. Caller persists results."""
-    prompt = build_prompt(source, owner, thread_names, known_people)
+    """Run the fast path end-to-end. Caller persists results.
+
+    `threads` is a list of `{"slug": str, "thesis": str}` records.
+    """
+    prompt = build_prompt(source, owner, threads, known_people)
     response = llm(prompt)
     return parse_response(response)
 

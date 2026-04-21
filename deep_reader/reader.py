@@ -210,8 +210,12 @@ def _run_fast_path(
 
     with console.status("[dim]Analyzing…[/dim]"):
         known_people = [p.name for p in state.people.values()]
+        # Load each active thread's thesis (truncated inside build_prompt) so
+        # the LLM can make real judgments about which threads this source
+        # advances — not just pattern-match on slugs.
+        threads_for_prompt = _load_thread_theses(wiki, source_state.threads)
         result = fast_path.run(
-            source, state.owner, source_state.threads, known_people, llm
+            source, state.owner, threads_for_prompt, known_people, llm
         )
 
     # Write the detail page (single chunk at index 0 for fast-path sources).
@@ -401,6 +405,20 @@ def _apply_fast_path_threads(
         threads_created.append(slug)
 
     return threads_updated, threads_created
+
+
+def _load_thread_theses(wiki: Wiki, thread_slugs: list[str]) -> list[dict]:
+    """Read each thread file and return `{"slug", "thesis"}` records.
+
+    Unknown or missing threads yield an empty thesis, which the prompt
+    formatter renders as "(no thesis yet)".
+    """
+    out: list[dict] = []
+    for slug in thread_slugs:
+        content = wiki.read_thread(slug) or ""
+        thesis = extract_section(content, "Thesis") if content else ""
+        out.append({"slug": slug, "thesis": thesis})
+    return out
 
 
 def _people_slug(name: str) -> str:

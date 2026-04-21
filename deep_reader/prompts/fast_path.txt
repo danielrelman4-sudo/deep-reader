@@ -14,6 +14,8 @@ Date: {source_date}
 Known attendees: {known_attendees}
 
 ## Existing Threads
+Each existing thread is shown with its slug and one-sentence thesis. When deciding whether this source advances a thread, judge against the thesis — not just the slug. If a thread's thesis is stated as "(no thesis yet)", use the slug as your best signal.
+
 {thread_list}
 
 ## Existing People
