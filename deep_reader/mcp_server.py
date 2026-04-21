@@ -167,10 +167,30 @@ def build_server(vault_root: Path):
 
     @mcp.resource("vault://sources/{slug}")
     def source_page(slug: str) -> str:
-        path = config.wiki_sources / slug / "_overview.md"
-        if not path.exists():
-            return f"# {slug}\n\n_(no overview)_\n"
-        return path.read_text()
+        """Full source content: overview + every chunk page.
+
+        For short sources (meetings, notes, short docs) this is the
+        overview summary plus the single chunk-001.md, which contains
+        decisions, attendees, action items, concepts — everything Claude
+        parsed during record_*. For long-form sources (books, papers)
+        it's the overview plus all chunks concatenated.
+
+        This is what Claude should fetch after search() identifies a
+        source as relevant — the search result only returns the first
+        paragraph of the overview, which isn't enough for substantive
+        questions.
+        """
+        src_dir = config.wiki_sources / slug
+        if not src_dir.exists():
+            return f"# {slug}\n\n_(source not found)_\n"
+        parts: list[str] = []
+        overview = src_dir / "_overview.md"
+        if overview.exists():
+            parts.append(overview.read_text())
+        for chunk_path in sorted(src_dir.glob("chunk-*.md")):
+            parts.append(f"\n---\n\n## {chunk_path.stem}\n")
+            parts.append(chunk_path.read_text())
+        return "\n".join(parts) if parts else f"# {slug}\n\n_(no content)_\n"
 
     @mcp.resource("vault://threads/{name}")
     def thread_page(name: str) -> str:
@@ -204,7 +224,23 @@ def build_server(vault_root: Path):
 
     @mcp.tool()
     def search(query: str, limit: int = 10) -> dict:
-        """Search across sources, threads, concepts, people, and open action items."""
+        """Route a query across sources, threads, concepts, people, and open action items.
+
+        This is a ROUTING tool. It returns snippets only — first paragraph
+        of each source overview, truncated thesis for threads, etc. For
+        substantive questions you MUST follow up with:
+          - `get_source(slug)` or `vault://sources/{slug}` for a source's
+            full content (overview + all chunk pages with decisions,
+            attendees, action items, concepts, the full structured analysis)
+          - `vault://threads/{name}` for a thread's full evidence log
+          - `vault://people/{slug}` for a person's full interaction record
+          - `get_person(name)` for a person's full record
+
+        Never synthesize an answer from search snippets alone — always
+        fetch the full content of the top 1-3 hits that matter to the
+        question. The snippet tells you WHAT is relevant; the full
+        content tells you WHY.
+        """
         r = search_fn(query, config, limit=limit)
         return {
             "sources": r.sources,
@@ -212,6 +248,45 @@ def build_server(vault_root: Path):
             "concepts": r.concepts,
             "people": r.people,
             "action_items": r.action_items,
+            "_hint": (
+                "Call get_source(slug) or vault://sources/{slug} on the top "
+                "source hits to get the full content before answering."
+            ),
+        }
+
+    @mcp.tool()
+    def get_source(slug: str) -> dict:
+        """Return the full content of a source: overview + all chunk pages.
+
+        Use this after `search` identifies a source as relevant. The
+        search tool only returns the first paragraph of the overview —
+        this tool gives you everything, including the structured sections
+        (decisions, attendees, action items, concepts) that were parsed
+        during ingest.
+        """
+        src_dir = config.wiki_sources / slug
+        if not src_dir.exists():
+            return {"error": f"source '{slug}' not found"}
+        overview_path = src_dir / "_overview.md"
+        overview = overview_path.read_text() if overview_path.exists() else ""
+        chunks = []
+        for chunk_path in sorted(src_dir.glob("chunk-*.md")):
+            chunks.append({
+                "name": chunk_path.stem,
+                "content": chunk_path.read_text(),
+            })
+        state = GlobalState.load(config.state_file)
+        src_state = state.sources.get(slug)
+        meta: dict = {"slug": slug}
+        if src_state:
+            meta["source_type"] = src_state.source_type
+            meta["attendees"] = src_state.attendees
+            if src_state.meeting_date:
+                meta["date"] = src_state.meeting_date
+        return {
+            "meta": meta,
+            "overview": overview,
+            "chunks": chunks,
         }
 
     @mcp.tool()
@@ -991,6 +1066,41 @@ present in the source, omit or pass [] for anything that isn't):
             "3. Report: my top open items ranked by age, anything I'm "
             "waiting on that's been sitting too long, the 3-5 most recent "
             "sources, and one concrete thing to do next."
+        )
+
+    @mcp.prompt(
+        description=(
+            "Ask a substantive question about the vault. Drives Claude "
+            "through the proper retrieve-then-synthesize pattern so answers "
+            "are grounded in the actual content, not reconstructed from "
+            "search snippets."
+        ),
+    )
+    def deep_query(question: str) -> str:
+        return (
+            f"Answer this question by reading the vault properly, not by "
+            f"reasoning from search snippets: {question}\n"
+            "\n"
+            "Follow this exact pattern:\n"
+            "1. Call `search(query=...)` with a targeted query. Note "
+            "which sources and threads scored highest.\n"
+            "2. For each top source hit that looks relevant, call "
+            "`get_source(slug)` to read its full content (overview + "
+            "chunk pages with decisions, action items, concepts).\n"
+            "3. For each top thread hit, fetch `vault://threads/{name}` "
+            "to see the full evidence log, not just the thesis.\n"
+            "4. If a person is central to the question, call "
+            "`get_person(name)` for their full interaction history.\n"
+            "5. ONLY THEN synthesize the answer. Cite specific sources "
+            "and quote actual content when the question is about what "
+            "was said or decided.\n"
+            "6. If after retrieval you still don't have enough to answer "
+            "well, say what's missing rather than making it up.\n"
+            "\n"
+            "The goal is an answer grounded in the vault, not an answer "
+            "reconstructed from your general knowledge of the topic. If "
+            "the vault has the substance, your answer should quote or "
+            "paraphrase the vault, not restate what's generally true."
         )
 
     return mcp
