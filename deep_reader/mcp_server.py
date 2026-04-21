@@ -223,36 +223,57 @@ def build_server(vault_root: Path):
     # ---------- Tools ----------
 
     @mcp.tool()
-    def search(query: str, limit: int = 10) -> dict:
-        """Route a query across sources, threads, concepts, people, and open action items.
+    def search(query: str, limit: int = 10, depth: str = "full") -> dict:
+        """Search the vault. Returns FULL content of top hits by default.
 
-        This is a ROUTING tool. It returns snippets only — first paragraph
-        of each source overview, truncated thesis for threads, etc. For
-        substantive questions you MUST follow up with:
-          - `get_source(slug)` or `vault://sources/{slug}` for a source's
-            full content (overview + all chunk pages with decisions,
-            attendees, action items, concepts, the full structured analysis)
-          - `vault://threads/{name}` for a thread's full evidence log
-          - `vault://people/{slug}` for a person's full interaction record
-          - `get_person(name)` for a person's full record
+        depth="full" (default): inline the full content of the top 3 source
+        hits and top 3 thread hits, so Claude can answer substantive
+        questions from a single call without follow-up retrieval. This is
+        the right default for "tell me about X" / "what did we decide
+        about Y" / "why did we choose Z" questions.
 
-        Never synthesize an answer from search snippets alone — always
-        fetch the full content of the top 1-3 hits that matter to the
-        question. The snippet tells you WHAT is relevant; the full
-        content tells you WHY.
+        depth="lite": return routing snippets only — faster, lower token
+        cost. Use when the user is just scanning for what sources/threads
+        mention a term, or when Claude plans to follow up with
+        get_source / vault://threads/{name} anyway.
+
+        Fields returned:
+          sources: [{slug, score, snippet, content?}] — content populated
+            only at depth=full for the top 3
+          threads: [{name, score, thesis, content?}] — content populated
+            only at depth=full for the top 3
+          concepts: [{name, score, snippet}]
+          people: [{slug, name, email, role, appearances, score}]
+          action_items: [{id, description, owner, source, category, ...}]
         """
         r = search_fn(query, config, limit=limit)
-        return {
-            "sources": r.sources,
-            "threads": r.threads,
+        out: dict = {
+            "sources": list(r.sources),
+            "threads": list(r.threads),
             "concepts": r.concepts,
             "people": r.people,
             "action_items": r.action_items,
-            "_hint": (
-                "Call get_source(slug) or vault://sources/{slug} on the top "
-                "source hits to get the full content before answering."
-            ),
+            "depth": depth,
         }
+
+        if depth == "full":
+            # Inline top-N full content so Claude doesn't have to follow up.
+            for i, src in enumerate(out["sources"][:3]):
+                slug = src["slug"]
+                src_dir = config.wiki_sources / slug
+                parts = []
+                ov = src_dir / "_overview.md"
+                if ov.exists():
+                    parts.append(ov.read_text())
+                for cp in sorted(src_dir.glob("chunk-*.md")):
+                    parts.append(f"\n---\n\n## {cp.stem}\n" + cp.read_text())
+                out["sources"][i] = {**src, "content": "\n".join(parts)}
+            for i, t in enumerate(out["threads"][:3]):
+                path = config.wiki_threads / f"{t['name']}.md"
+                if path.exists():
+                    out["threads"][i] = {**t, "content": path.read_text()}
+
+        return out
 
     @mcp.tool()
     def get_source(slug: str) -> dict:
@@ -1070,10 +1091,35 @@ present in the source, omit or pass [] for anything that isn't):
 
     @mcp.prompt(
         description=(
-            "Ask a substantive question about the vault. Drives Claude "
-            "through the proper retrieve-then-synthesize pattern so answers "
-            "are grounded in the actual content, not reconstructed from "
-            "search snippets."
+            "Quick scan — list what the vault has on a term, no synthesis. "
+            "Use when you just want to see WHAT sources/threads mention "
+            "something, not a detailed answer. Slash-command shortcut for "
+            "the lightweight search path."
+        ),
+    )
+    def quick_scan(term: str) -> str:
+        return (
+            f"Do a quick lightweight scan for '{term}' and return just a "
+            f"tight list — no synthesis, no reasoning beyond what's in the "
+            f"vault.\n"
+            "\n"
+            f"Steps:\n"
+            f"1. Call `search(query='{term}', depth='lite')`.\n"
+            "2. Format a short bullet list of what turned up, grouped by "
+            "type (sources, threads, concepts, people, action items). "
+            "For each hit show just the name/slug and a one-line snippet.\n"
+            "3. If nothing matched, say so — don't pad.\n"
+            "\n"
+            "Do NOT fetch full content, do NOT try to answer a question "
+            "from these results. This is just a scan."
+        )
+
+    @mcp.prompt(
+        description=(
+            "Force deep retrieval for a substantive question. Usually "
+            "unnecessary — default `search` already returns full content "
+            "of top hits. Keep this as a fallback if Claude ever answers "
+            "from snippets instead of retrieved content."
         ),
     )
     def deep_query(question: str) -> str:
