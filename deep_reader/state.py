@@ -113,11 +113,15 @@ class ActionItem(BaseModel):
     id: str                           # content hash + source + owner
     description: str
     owner: str                        # person slug (always set; use 'unassigned' if truly unknown)
-    source: str                       # source slug
+    source: str                       # primary source slug (or Slack permalink, etc.)
     created_at: datetime
     status: str = "open"              # open | done | dropped
     category: str = "mine"            # mine | waiting_on | other
     completed_at: Optional[datetime] = None
+    # Additional source references attached after the item was first created
+    # (e.g., a Slack message reaffirming a commitment first captured in a
+    # meeting). Used for provenance tracking; doesn't change identity.
+    additional_sources: List[str] = Field(default_factory=list)
 
 
 class GlobalState(BaseModel):

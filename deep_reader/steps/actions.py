@@ -43,19 +43,37 @@ def _find_existing(
     return None
 
 
+def _attach_source(item: ActionItem, source_ref: str) -> bool:
+    """Append a new source reference to an existing item if not already present.
+
+    Returns True if anything was added, False if the source was already
+    associated (either as the primary or in additional_sources).
+    """
+    if not source_ref:
+        return False
+    if source_ref == item.source or source_ref in item.additional_sources:
+        return False
+    item.additional_sources.append(source_ref)
+    return True
+
+
 def add_mine(
     state: GlobalState,
     description: str,
     source_slug: str,
     created_at: datetime | None = None,
 ) -> ActionItem:
-    """Add a personal action item (owned by the vault owner)."""
+    """Add a personal action item (owned by the vault owner).
+
+    On exact-description dedup, appends source_slug to the existing item's
+    additional_sources rather than silently dropping it — preserves
+    provenance when the same commitment appears in multiple sources
+    (e.g., a meeting AND a Slack reaffirmation).
+    """
     owner_slug = _vault_owner_slug(state)
     existing = _find_existing(state, description, owner_slug)
     if existing:
-        if source_slug not in existing.source and source_slug:
-            # Keep the earliest source reference; don't overwrite.
-            pass
+        _attach_source(existing, source_slug)
         return existing
     item = ActionItem(
         id=_make_id(description, owner_slug, source_slug),
@@ -81,6 +99,7 @@ def add_waiting_on(
     person = resolve_person(state, person_name)
     existing = _find_existing(state, description, person.slug)
     if existing:
+        _attach_source(existing, source_slug)
         return existing
     item = ActionItem(
         id=_make_id(description, person.slug, source_slug),
@@ -105,6 +124,7 @@ def add_other(
     person = resolve_person(state, person_name)
     existing = _find_existing(state, description, person.slug)
     if existing:
+        _attach_source(existing, source_slug)
         return existing
     item = ActionItem(
         id=_make_id(description, person.slug, source_slug),
@@ -117,6 +137,25 @@ def add_other(
     )
     state.action_items.append(item)
     return item
+
+
+def link_source(
+    state: GlobalState,
+    action_id: str,
+    source_ref: str,
+) -> ActionItem | None:
+    """Attach an additional source reference to an existing action item.
+
+    Used by Claude when it identifies a paraphrase — e.g., a Slack message
+    that's a re-mention of a commitment already captured from a meeting.
+    Lets us preserve the trail to the new source without creating a
+    duplicate item. Returns None if the action_id doesn't exist.
+    """
+    for item in state.action_items:
+        if item.id == action_id:
+            _attach_source(item, source_ref)
+            return item
+    return None
 
 
 def close(state: GlobalState, action_id: str) -> ActionItem | None:

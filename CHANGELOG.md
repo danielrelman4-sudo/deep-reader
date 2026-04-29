@@ -38,6 +38,13 @@ Redesigned for a cross-functional operator as the primary user. Original book-re
   - `/ingest_slack_thread` — ingests a specific Slack thread as a meeting-analog source (attendees, decisions, action items, threads).
 - All three reuse existing `record_note` / `record_meeting` / `add_action_item` / `add_waiting_on` flows — no new persistence logic.
 
+### Cross-source action-item dedup
+- `ActionItem` gains `additional_sources: list[str]` for tracking re-mentions of the same commitment across sources. Backward-compatible (default empty list).
+- `add_mine` / `add_waiting_on` / `add_other`: on exact-description dedup, append the new source to `additional_sources` instead of silently dropping it. Provenance preserved.
+- New MCP tool `link_action_item(id, source_ref)` for explicit paraphrase dedup — Claude calls this when it spots a Slack message that's a re-mention of an existing meeting-sourced item.
+- Slack ingest prompts (`/ingest_slack_action_items`, `/ingest_slack_personal`) updated to instruct Claude to compare candidates against existing open items and use `link_action_item` for paraphrases instead of creating duplicates. Bias is "lean toward linking, not adding."
+- `action_items.md` and `waiting_on.md` renderers updated to show all sources (primary + additional) per item, with smart formatting for source slugs vs. URLs vs. free-form refs.
+
 ### Granola automation
 - MCP prompts (saved workflows) for one-click Granola integration: `ingest_granola_today`, `ingest_granola_week`, `ingest_granola_range(start, end)`, plus `catch_me_up`
 - These assume Granola's own MCP server (launched Feb 2026) is registered alongside this one in Claude Desktop — Claude orchestrates across both

@@ -111,7 +111,8 @@ Use the `/quick_scan <term>` slash command when you just want to see what source
 | `search(query, depth="full"|"lite")` | Cross-entity search. `depth="full"` (default) returns full content of top source+thread hits; `"lite"` returns snippets only |
 | `get_source(slug)` | Full content of a single source — overview + all chunks with decisions, attendees, structured analysis |
 | `list_action_items` / `list_waiting_on` | Your to-do list / items owed by others |
-| `add_action_item` / `add_waiting_on` / `close_action_item` | Action-item CRUD. Mutations re-render the affected person pages + central lists so state stays consistent. |
+| `add_action_item` / `add_waiting_on` / `close_action_item` | Action-item CRUD. Exact-description dedup auto-appends new sources to `additional_sources`. Mutations re-render the affected person pages + central lists. |
+| `link_action_item(id, source_ref)` | Attach an additional source reference to an existing item. For paraphrase dedup — when Slack mentions a commitment already captured from a meeting. |
 | `list_people` / `get_person` / `merge_people` | People directory |
 | `forget_source(slug)` | Remove a source's page, state, attributed action items, and thread evidence. Raw file preserved. |
 | `recap_prep` / `sync_recap` | Daily-recap skill integration |

@@ -436,6 +436,25 @@ def build_server(vault_root: Path):
         return _dump_action(item, state)
 
     @mcp.tool()
+    def link_action_item(id: str, source_ref: str) -> dict:
+        """Attach an additional source reference to an existing action item.
+
+        Use this when you've spotted a paraphrase / re-mention — e.g.,
+        a Slack message reaffirming a commitment that was already captured
+        from a meeting. Adds the new source (Slack permalink, source slug,
+        URL, etc.) to the item's additional_sources without creating a
+        duplicate. Preserves the full trail without inflating the list.
+        """
+        from deep_reader.steps import actions as actions_step
+        state = GlobalState.load(config.state_file)
+        item = actions_step.link_source(state, id, source_ref)
+        if not item:
+            return {"error": f"no item with id {id}"}
+        state.save(config.state_file)
+        _rerender_after_action_change(config, state, item)
+        return _dump_action(item, state)
+
+    @mcp.tool()
     def list_people(query: str | None = None) -> list[dict]:
         """List known people, optionally filtered."""
         state = GlobalState.load(config.state_file)
@@ -1076,8 +1095,9 @@ present in the source, omit or pass [] for anything that isn't):
         description=(
             "Pull today's notes from your personal Slack channel and "
             "ingest them — captures self-todos and reminders, files the "
-            "day as a note source. Requires the Slack MCP server "
-            "registered alongside this one."
+            "day as a note source. Dedupes against existing items to "
+            "avoid double-counting reaffirmations. Requires the Slack "
+            "MCP server registered alongside this one."
         ),
     )
     def ingest_slack_personal(date_str: str = "today") -> str:
@@ -1087,83 +1107,107 @@ present in the source, omit or pass [] for anything that isn't):
             "\n"
             "1. Call `get_ingest_context()` for owner identity and "
             "active threads.\n"
-            "2. Use the Slack MCP to find my personal channel. It's "
+            "2. Call `list_action_items(status='open')` — hold this "
+            "list; you'll dedup against it in step 6.\n"
+            "3. Use the Slack MCP to find my personal channel. It's "
             "typically: a DM I have with myself, OR a private channel "
             "I use for self-notes (often named like #my-notes / "
             "#scratch / #dan-todo or similar). If you can't tell which "
             "channel is the personal one, ASK me before guessing.\n"
-            "3. Read messages from that channel for the target date.\n"
-            "4. Check for duplicates: call `search(query='slack personal "
-            f"{date_str}', depth='lite')`. If a source like "
-            "'note-slack-personal-<date>' already exists, ask whether "
-            "to skip, append, or replace before proceeding.\n"
-            "5. Bundle the day's content as a single note via "
+            "4. Read messages from that channel for the target date.\n"
+            "5. Check for duplicate-day ingest: call `search(query="
+            f"'slack personal {date_str}', depth='lite')`. If a source "
+            "like 'note-slack-personal-<date>' already exists, ask "
+            "whether to skip, append, or replace before proceeding.\n"
+            "6. **Pre-classify candidate todos before record_note**: "
+            "for each actionable item you'd extract from the messages, "
+            "compare against the existing-items list from step 2. "
+            "Categorize each as:\n"
+            "   - **NEW**: not yet on my list — include in "
+            "`action_items_mine` for the record_note call.\n"
+            "   - **PARAPHRASE of existing item**: do NOT include in "
+            "action_items_mine. After record_note completes, call "
+            "`link_action_item(id=<existing-id>, source_ref=<Slack "
+            "permalink>)` for each one to attach the Slack reference "
+            "to the existing item.\n"
+            "7. Bundle the day's content as a single note via "
             "`record_note(...)`:\n"
             "   - title: 'Slack personal notes — <YYYY-MM-DD>'\n"
-            "   - body: the messages verbatim, with timestamps. Include "
-            "the Slack permalink for each message if Slack MCP exposes "
-            "it.\n"
+            "   - body: the messages verbatim, with timestamps and "
+            "permalinks if available\n"
             "   - summary: 1-3 sentences on the day's themes\n"
-            "   - action_items_mine: [str] for things I committed to "
-            "or reminded myself to do. Personal-channel messages skew "
-            "heavily toward todos — be willing to extract many small "
-            "items, not just big ones.\n"
+            "   - action_items_mine: only the NEW items from step 6\n"
             "   - waiting_on: [{person, description}] for things I "
-            "noted I'm owed by named others.\n"
-            "   - thread_updates: only if a day's notes meaningfully "
-            "advance an existing thread (often they don't).\n"
-            "   - concepts: tag any recurring themes.\n"
-            "6. Report what landed: count of action items by category, "
-            "any threads advanced, anything skipped as duplicate.\n"
+            "noted I'm owed by named others\n"
+            "   - thread_updates: only if the day's notes meaningfully "
+            "advance an existing thread\n"
+            "   - concepts: tag recurring themes\n"
+            "8. After record_note: call `link_action_item` for each "
+            "PARAPHRASE identified in step 6.\n"
+            "9. Report what landed: NEW items added, PARAPHRASES "
+            "linked to existing, threads advanced, duplicates skipped.\n"
             "\n"
-            "If a message is a half-formed thought with no clear next "
-            "step, leave it in the body but don't extract an action "
-            "item from it.\n"
+            "Bias toward linking, not adding. Personal channels often "
+            "re-mention things already on the list ('still need to send "
+            "deck') — those should attach to the existing item, not "
+            "duplicate it. Half-formed thoughts with no clear next step: "
+            "leave in body, don't extract.\n"
         )
 
     @mcp.prompt(
         description=(
             "Scan today's Slack chats across channels for action items "
             "you committed to or that others owe you. Extracts items "
-            "into your central list; does NOT create source pages for "
-            "regular chat. Use ingest_slack_thread for substantive "
-            "threads worth their own source page."
+            "into your central list, deduping against items already "
+            "captured from meetings or earlier ingests. Does NOT create "
+            "source pages for regular chat — use ingest_slack_thread "
+            "for substantive threads worth their own page."
         ),
     )
     def ingest_slack_action_items(date_str: str = "today") -> str:
         return (
             f"Scan my Slack chats from {date_str} for action items "
-            f"only — no source pages, just extract commitments into my "
-            f"action items list.\n"
+            f"only — no source pages, just extract commitments. The "
+            f"key skill here is dedup against items already captured "
+            f"from meetings (a Slack reaffirmation of a commitment is "
+            f"common and shouldn't double up).\n"
             "\n"
             "Steps:\n"
-            "1. Call `get_ingest_context()` for owner identity, threads, "
-            "and known people (so you can reuse existing person slugs).\n"
-            "2. Use the Slack MCP to identify channels I was active in "
+            "1. Call `get_ingest_context()` for owner identity and "
+            "known people.\n"
+            "2. Call `list_action_items(status='open')` and "
+            "`list_waiting_on(status='open')`. Hold this list — you'll "
+            "compare every Slack candidate against it.\n"
+            "3. Use the Slack MCP to identify channels I was active in "
             "for the target date. DMs, small group chats, and project "
             "channels matter; large broadcast channels usually don't.\n"
-            "3. For each relevant channel/thread, look for action-item-"
+            "4. For each relevant channel/thread, look for action-item-"
             "shaped commitments:\n"
             "   - Things I said I'd do ('I'll send the deck')\n"
             "   - Things someone else said they'd do for me ('Jane will "
             "follow up by Friday')\n"
             "   - Explicit asks where the answer was a clear yes\n"
-            "4. For each item:\n"
-            "   - Owned by me → `add_action_item(description, "
-            "source=<Slack permalink or 'slack:#channel'>)` \n"
-            "   - Owed to me by named person → `add_waiting_on("
-            "description, person, source=<permalink>)`\n"
-            "   - Between other parties / no clear owner → skip\n"
-            "5. The add_* tools dedup by (description, owner) — but "
-            "obvious paraphrases of an already-tracked item should be "
-            "skipped manually too.\n"
-            "6. Report what landed: count by category, channels scanned, "
-            "anything skipped as duplicate.\n"
+            "5. **Dedup decision per candidate**, against the list from "
+            "step 2:\n"
+            "   - **Exact paraphrase of an existing item** (same intent, "
+            "different wording — e.g., 'send the deck Friday' vs "
+            "existing 'Send pricing deck to Jane by Friday'): call "
+            "`link_action_item(id=<existing-id>, source_ref=<Slack "
+            "permalink>)`. Do NOT call add_action_item.\n"
+            "   - **New item**, owned by me: call `add_action_item("
+            "description, source=<Slack permalink or 'slack:#channel'>)`\n"
+            "   - **New item**, owed to me by named person: call "
+            "`add_waiting_on(description, person, source=<permalink>)`\n"
+            "   - **Aspirational / speculative** ('we should probably do "
+            "X'): skip.\n"
+            "   - **Between other parties / no clear owner**: skip.\n"
+            "6. Report: count of new items added, count of links to "
+            "existing items, channels scanned, anything skipped.\n"
             "\n"
-            "Be conservative — false positives clutter my list. Only "
-            "extract items where the commitment is explicit, not "
-            "speculative or aspirational. 'We should probably do X' is "
-            "not a commitment; 'I'll do X by Friday' is.\n"
+            "Bias toward linking, not adding. If you're unsure whether "
+            "a Slack commitment is the same thing as an existing item, "
+            "lean toward linking — it's lossless (you can always split "
+            "later). Adding a duplicate item is harder to undo."
         )
 
     @mcp.prompt(

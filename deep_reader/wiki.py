@@ -159,9 +159,10 @@ def render_action_items(wiki: "Wiki", state) -> None:
         lines.append("_(none)_\n")
     else:
         for a in open_items:
+            sources_str = _format_sources(a)
             lines.append(
                 f"- [ ] {a.description} "
-                f"— from [[sources/{a.source}/_overview|{a.source}]] "
+                f"— {sources_str} "
                 f"— since {a.created_at.date().isoformat()} "
                 f"<!-- id:{a.id} -->"
             )
@@ -198,10 +199,11 @@ def render_waiting_on(wiki: "Wiki", state) -> None:
                 owner_name = _owner_display(state, a.owner)
                 lines.append(f"\n## {owner_name}\n")
                 current_owner = a.owner
+            sources_str = _format_sources(a)
             lines.append(
                 f"- {a.description} "
                 f"— since {a.created_at.date().isoformat()} "
-                f"— re [[sources/{a.source}/_overview|{a.source}]] "
+                f"— re {sources_str} "
                 f"<!-- id:{a.id} -->"
             )
 
@@ -215,3 +217,30 @@ def _owner_display(state, owner_slug: str) -> str:
     if p:
         return f"[[people/{p.slug}|{p.name}]]"
     return owner_slug
+
+
+def _format_sources(a) -> str:
+    """Render an action item's source(s) — primary plus any additional refs.
+
+    A source can be a wiki source slug (rendered as a wiki-link), a Slack
+    permalink (URL — rendered raw), or a free-form string (kept as-is).
+    """
+    refs = [a.source] + list(getattr(a, "additional_sources", []) or [])
+    rendered = [_render_source_ref(r) for r in refs if r]
+    if not rendered:
+        return ""
+    if len(rendered) == 1:
+        return f"from {rendered[0]}"
+    return f"from {rendered[0]} (also: {', '.join(rendered[1:])})"
+
+
+def _render_source_ref(ref: str) -> str:
+    """Decide how to render a source reference based on its shape."""
+    if not ref:
+        return ""
+    if ref.startswith("http://") or ref.startswith("https://"):
+        return f"[link]({ref})"
+    if ref.startswith("slack:"):
+        return f"`{ref}`"
+    # Default: assume it's a source slug
+    return f"[[sources/{ref}/_overview|{ref}]]"
