@@ -140,11 +140,14 @@ Prefer the `record_*` tools — the legacy tools exist for users running their o
 | `/ingest_granola_today` | Pulls today's meetings from Granola MCP and records each |
 | `/ingest_granola_week` | Last 7 days; skips duplicates |
 | `/ingest_granola_range(start, end)` | Arbitrary date range |
+| `/ingest_slack_personal(date)` | Pull self-notes / todos from your personal Slack channel and file as a daily note + extract action items |
+| `/ingest_slack_action_items(date)` | Scan day's Slack chats for action items only — no source pages, just adds to action_items / waiting_on |
+| `/ingest_slack_thread` | Ingest a specific Slack thread as a meeting-analog source page (decisions, attendees, full structured ingest) |
 | `/quick_scan(term)` | Lightweight scan — no synthesis, just what the vault has on a term |
 | `/deep_query(question)` | Force deep retrieve-then-synthesize pattern. Usually unnecessary (default `search` already does this) — fallback if Claude ever answers from snippets. |
 | `/catch_me_up` | Concise brief of open items, recent activity, one thing to do next |
 
-The `/ingest_granola_*` prompts require Granola's own MCP server to be registered alongside this one (see "Granola integration" below).
+The `/ingest_granola_*` prompts require Granola's own MCP server to be registered alongside this one (see "Granola integration" below). The `/ingest_slack_*` prompts require a Slack MCP server.
 
 ### Typed schema for structured tools
 
@@ -156,6 +159,20 @@ The `/ingest_granola_*` prompts require Granola's own MCP server to be registere
 - `PersonItem`: `{person: str, description: str}` — both required (used for `waiting_on` / `other_commitments`)
 
 Claude Desktop gets these as JSON Schema via `inputSchema` on each tool — it sees the contract before calling.
+
+## Slack integration
+
+Capture self-notes, action items, and substantive threads from Slack — same pattern as Granola: register the Slack MCP server alongside this one in Claude Desktop, then invoke the saved prompts.
+
+Three flows for three different patterns:
+
+- **Personal channel ingest** (`/ingest_slack_personal`) — most users have a private channel or self-DM where they leave todos and reminders to themselves throughout the day. This prompt pulls that day's messages, files them as a `note` source ("Slack personal notes — YYYY-MM-DD"), and extracts every committed action item into your central list. Idempotent — re-running for the same day skips or merges.
+
+- **Action items across all chats** (`/ingest_slack_action_items`) — scans the day's DMs and active group chats for explicit commitments ("I'll send the deck", "Jane will follow up"). Adds them to your action items / waiting-on lists with the Slack permalink as the source. Doesn't create source pages — purely an extraction pass. Conservative by design: aspirational language doesn't qualify, only explicit commitments.
+
+- **Substantive thread ingest** (`/ingest_slack_thread`) — when a Slack thread had real back-and-forth and produced decisions, treat it as a meeting analog. Records attendees, decisions, action items — same structure as a meeting from Granola.
+
+For Slack MCP install instructions, check Slack's integration docs. Once registered alongside `deep-reader`, invoke any of the slash commands above.
 
 ## Granola integration
 

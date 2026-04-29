@@ -1074,6 +1074,135 @@ present in the source, omit or pass [] for anything that isn't):
 
     @mcp.prompt(
         description=(
+            "Pull today's notes from your personal Slack channel and "
+            "ingest them — captures self-todos and reminders, files the "
+            "day as a note source. Requires the Slack MCP server "
+            "registered alongside this one."
+        ),
+    )
+    def ingest_slack_personal(date_str: str = "today") -> str:
+        return (
+            f"Pull and ingest my Slack personal-channel notes from "
+            f"{date_str}. Steps:\n"
+            "\n"
+            "1. Call `get_ingest_context()` for owner identity and "
+            "active threads.\n"
+            "2. Use the Slack MCP to find my personal channel. It's "
+            "typically: a DM I have with myself, OR a private channel "
+            "I use for self-notes (often named like #my-notes / "
+            "#scratch / #dan-todo or similar). If you can't tell which "
+            "channel is the personal one, ASK me before guessing.\n"
+            "3. Read messages from that channel for the target date.\n"
+            "4. Check for duplicates: call `search(query='slack personal "
+            f"{date_str}', depth='lite')`. If a source like "
+            "'note-slack-personal-<date>' already exists, ask whether "
+            "to skip, append, or replace before proceeding.\n"
+            "5. Bundle the day's content as a single note via "
+            "`record_note(...)`:\n"
+            "   - title: 'Slack personal notes — <YYYY-MM-DD>'\n"
+            "   - body: the messages verbatim, with timestamps. Include "
+            "the Slack permalink for each message if Slack MCP exposes "
+            "it.\n"
+            "   - summary: 1-3 sentences on the day's themes\n"
+            "   - action_items_mine: [str] for things I committed to "
+            "or reminded myself to do. Personal-channel messages skew "
+            "heavily toward todos — be willing to extract many small "
+            "items, not just big ones.\n"
+            "   - waiting_on: [{person, description}] for things I "
+            "noted I'm owed by named others.\n"
+            "   - thread_updates: only if a day's notes meaningfully "
+            "advance an existing thread (often they don't).\n"
+            "   - concepts: tag any recurring themes.\n"
+            "6. Report what landed: count of action items by category, "
+            "any threads advanced, anything skipped as duplicate.\n"
+            "\n"
+            "If a message is a half-formed thought with no clear next "
+            "step, leave it in the body but don't extract an action "
+            "item from it.\n"
+        )
+
+    @mcp.prompt(
+        description=(
+            "Scan today's Slack chats across channels for action items "
+            "you committed to or that others owe you. Extracts items "
+            "into your central list; does NOT create source pages for "
+            "regular chat. Use ingest_slack_thread for substantive "
+            "threads worth their own source page."
+        ),
+    )
+    def ingest_slack_action_items(date_str: str = "today") -> str:
+        return (
+            f"Scan my Slack chats from {date_str} for action items "
+            f"only — no source pages, just extract commitments into my "
+            f"action items list.\n"
+            "\n"
+            "Steps:\n"
+            "1. Call `get_ingest_context()` for owner identity, threads, "
+            "and known people (so you can reuse existing person slugs).\n"
+            "2. Use the Slack MCP to identify channels I was active in "
+            "for the target date. DMs, small group chats, and project "
+            "channels matter; large broadcast channels usually don't.\n"
+            "3. For each relevant channel/thread, look for action-item-"
+            "shaped commitments:\n"
+            "   - Things I said I'd do ('I'll send the deck')\n"
+            "   - Things someone else said they'd do for me ('Jane will "
+            "follow up by Friday')\n"
+            "   - Explicit asks where the answer was a clear yes\n"
+            "4. For each item:\n"
+            "   - Owned by me → `add_action_item(description, "
+            "source=<Slack permalink or 'slack:#channel'>)` \n"
+            "   - Owed to me by named person → `add_waiting_on("
+            "description, person, source=<permalink>)`\n"
+            "   - Between other parties / no clear owner → skip\n"
+            "5. The add_* tools dedup by (description, owner) — but "
+            "obvious paraphrases of an already-tracked item should be "
+            "skipped manually too.\n"
+            "6. Report what landed: count by category, channels scanned, "
+            "anything skipped as duplicate.\n"
+            "\n"
+            "Be conservative — false positives clutter my list. Only "
+            "extract items where the commitment is explicit, not "
+            "speculative or aspirational. 'We should probably do X' is "
+            "not a commitment; 'I'll do X by Friday' is.\n"
+        )
+
+    @mcp.prompt(
+        description=(
+            "Ingest a substantive Slack thread as its own source — for "
+            "when a back-and-forth conversation produced enough decision "
+            "/ context to warrant being its own page, not just an "
+            "action item. You'll provide the channel + thread."
+        ),
+    )
+    def ingest_slack_thread() -> str:
+        return (
+            "I'll point you at a specific Slack channel and thread to "
+            "ingest as a source. Steps:\n"
+            "\n"
+            "1. Call `get_ingest_context()`.\n"
+            "2. Use the Slack MCP to read the full thread (parent "
+            "message + all replies).\n"
+            "3. Treat this as a meeting analog — it has participants, "
+            "decisions, action items. Call `record_meeting(...)`:\n"
+            "   - title: a short descriptive title for the conversation "
+            "(infer from the parent message)\n"
+            "   - date: thread date\n"
+            "   - body: full thread text with usernames and timestamps\n"
+            "   - attendees: everyone who posted, with their names "
+            "(resolve via Slack user lookup if needed). Pass the vault "
+            "owner as one of the attendees.\n"
+            "   - summary, decisions, action_items_mine, waiting_on, "
+            "thread_updates, new_threads, concepts — same as a regular "
+            "meeting ingest.\n"
+            "4. Report what landed.\n"
+            "\n"
+            "If the thread is light (a few messages, no real decisions), "
+            "use `record_note(...)` instead of record_meeting — same "
+            "fields minus attendees/decisions/date.\n"
+        )
+
+    @mcp.prompt(
+        description=(
             "Catch me up — brief on what's changed in the vault: open "
             "items, new people, recent sources."
         ),

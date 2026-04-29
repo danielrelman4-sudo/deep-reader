@@ -31,6 +31,13 @@ Redesigned for a cross-functional operator as the primary user. Original book-re
 - `GlobalState` additions are all optional fields → existing `_state.json` loads unchanged
 - `migrate` command still backfills pre-v1.1 PREDICT step
 
+### Slack integration
+- Three new MCP prompts for Slack-driven ingest, mirroring the Granola pattern (require Slack MCP server registered alongside this one):
+  - `/ingest_slack_personal(date)` — pulls a day's messages from the user's personal Slack channel (self-notes, todos, reminders); files them as a daily `note` source and extracts action items into the central list. Idempotent across re-runs.
+  - `/ingest_slack_action_items(date)` — scans the day's DMs and group chats for explicit commitments only; adds to action items / waiting-on with Slack permalinks as source references. Doesn't create source pages.
+  - `/ingest_slack_thread` — ingests a specific Slack thread as a meeting-analog source (attendees, decisions, action items, threads).
+- All three reuse existing `record_note` / `record_meeting` / `add_action_item` / `add_waiting_on` flows — no new persistence logic.
+
 ### Granola automation
 - MCP prompts (saved workflows) for one-click Granola integration: `ingest_granola_today`, `ingest_granola_week`, `ingest_granola_range(start, end)`, plus `catch_me_up`
 - These assume Granola's own MCP server (launched Feb 2026) is registered alongside this one in Claude Desktop — Claude orchestrates across both
