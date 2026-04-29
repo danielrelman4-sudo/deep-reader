@@ -223,28 +223,27 @@ def build_server(vault_root: Path):
     # ---------- Tools ----------
 
     @mcp.tool()
-    def search(query: str, limit: int = 10, depth: str = "full") -> dict:
+    def search(
+        query: str,
+        limit: int = 10,
+        depth: str = "full",
+        inline_top_n: int = 5,
+    ) -> dict:
         """Search the vault. Returns FULL content of top hits by default.
 
-        depth="full" (default): inline the full content of the top 3 source
-        hits and top 3 thread hits, so Claude can answer substantive
-        questions from a single call without follow-up retrieval. This is
-        the right default for "tell me about X" / "what did we decide
-        about Y" / "why did we choose Z" questions.
+        depth="full" (default): inline the full content of the top
+        `inline_top_n` source hits and top `inline_top_n` thread hits,
+        so Claude can answer substantive questions from a single call
+        without follow-up retrieval. Default 5 — bump higher (7-10) when
+        you have a wider vault and want broader synthesis, lower (3) for
+        tight token budgets.
 
-        depth="lite": return routing snippets only — faster, lower token
-        cost. Use when the user is just scanning for what sources/threads
-        mention a term, or when Claude plans to follow up with
-        get_source / vault://threads/{name} anyway.
+        depth="lite": routing snippets only.
 
         Fields returned:
-          sources: [{slug, score, snippet, content?}] — content populated
-            only at depth=full for the top 3
-          threads: [{name, score, thesis, content?}] — content populated
-            only at depth=full for the top 3
-          concepts: [{name, score, snippet}]
-          people: [{slug, name, email, role, appearances, score}]
-          action_items: [{id, description, owner, source, category, ...}]
+          sources: [{slug, score, snippet, content?}]
+          threads: [{name, score, thesis, content?}]
+          concepts, people, action_items: structured metadata
         """
         r = search_fn(query, config, limit=limit)
         out: dict = {
@@ -254,11 +253,12 @@ def build_server(vault_root: Path):
             "people": r.people,
             "action_items": r.action_items,
             "depth": depth,
+            "inline_top_n": inline_top_n if depth == "full" else 0,
         }
 
         if depth == "full":
-            # Inline top-N full content so Claude doesn't have to follow up.
-            for i, src in enumerate(out["sources"][:3]):
+            n = max(1, min(inline_top_n, 20))  # bound it
+            for i, src in enumerate(out["sources"][:n]):
                 slug = src["slug"]
                 src_dir = config.wiki_sources / slug
                 parts = []
@@ -268,7 +268,7 @@ def build_server(vault_root: Path):
                 for cp in sorted(src_dir.glob("chunk-*.md")):
                     parts.append(f"\n---\n\n## {cp.stem}\n" + cp.read_text())
                 out["sources"][i] = {**src, "content": "\n".join(parts)}
-            for i, t in enumerate(out["threads"][:3]):
+            for i, t in enumerate(out["threads"][:n]):
                 path = config.wiki_threads / f"{t['name']}.md"
                 if path.exists():
                     out["threads"][i] = {**t, "content": path.read_text()}
@@ -434,6 +434,402 @@ def build_server(vault_root: Path):
         state.save(config.state_file)
         _rerender_after_action_change(config, state, item)
         return _dump_action(item, state)
+
+    # ---------- Synthesis: context-fetch + write-back tools ----------
+    #
+    # As the vault grows, the right shape for chat shifts from "Claude reads
+    # raw chunks on demand" to "Claude reads continuously-maintained
+    # synthesis articles". These tools support that shift: get_*_context
+    # bundles the source material Claude needs to write a synthesis;
+    # update_*_thesis / update_*_summary persist the result back. Pair with
+    # the /refresh_* prompts.
+
+    @mcp.tool()
+    def get_thread_full_context(slug: str, max_evidence: int = 30) -> dict:
+        """Return a thread + the content of every source it has evidence in.
+
+        Use before regenerating a thread's thesis. Bundles:
+          - the current thread file (thesis, evidence, status)
+          - for each source referenced in the evidence section: the
+            source's overview + chunk-001 (or all chunks if multi-chunk),
+            up to max_evidence sources.
+
+        This is what /refresh_thread_synthesis calls to get everything
+        needed to write a richer thesis in one tool call.
+        """
+        from deep_reader.thread_utils import extract_section
+        path = config.wiki_threads / f"{slug}.md"
+        if not path.exists():
+            return {"error": f"thread '{slug}' not found"}
+        thread_content = path.read_text()
+        thesis = extract_section(thread_content, "Thesis")
+        evidence = extract_section(thread_content, "Evidence")
+        status = extract_section(thread_content, "Status")
+
+        # Parse evidence lines for source references like [[<slug>/chunk-NNN]]
+        import re as _re
+        source_slugs: list[str] = []
+        seen: set[str] = set()
+        for match in _re.finditer(r"\[\[([^\]/]+)/chunk-\d+\]\]", evidence):
+            slug_ref = match.group(1)
+            if slug_ref not in seen:
+                seen.add(slug_ref)
+                source_slugs.append(slug_ref)
+
+        sources: list[dict] = []
+        for src_slug in source_slugs[:max_evidence]:
+            src_dir = config.wiki_sources / src_slug
+            if not src_dir.exists():
+                continue
+            parts = []
+            ov = src_dir / "_overview.md"
+            if ov.exists():
+                parts.append(ov.read_text())
+            for cp in sorted(src_dir.glob("chunk-*.md")):
+                parts.append(f"\n---\n\n## {cp.stem}\n" + cp.read_text())
+            sources.append({"slug": src_slug, "content": "\n".join(parts)})
+
+        return {
+            "slug": slug,
+            "current_thesis": thesis,
+            "evidence_log": evidence,
+            "status": status,
+            "evidence_source_count": len(source_slugs),
+            "evidence_sources_returned": len(sources),
+            "sources": sources,
+        }
+
+    @mcp.tool()
+    def update_thread_thesis(slug: str, new_thesis: str) -> dict:
+        """Replace the Thesis section of a thread file. Preserves Evidence + Status.
+
+        Used after /refresh_thread_synthesis: Claude reads the thread + its
+        evidence sources via get_thread_full_context, writes a richer
+        thesis (typically 3-5 paragraphs synthesizing how the topic has
+        developed), then calls this tool to persist.
+        """
+        from deep_reader.thread_utils import extract_section, assemble_thread
+        path = config.wiki_threads / f"{slug}.md"
+        if not path.exists():
+            return {"error": f"thread '{slug}' not found"}
+        existing = path.read_text()
+        evidence = extract_section(existing, "Evidence")
+        status = extract_section(existing, "Status")
+        path.write_text(assemble_thread(new_thesis.strip(), evidence, status))
+        return {"slug": slug, "thesis_chars": len(new_thesis.strip())}
+
+    @mcp.tool()
+    def get_person_full_context(slug: str, max_sources: int = 30) -> dict:
+        """Return a person + the content of every source they appear in.
+
+        Used before regenerating a person's summary. Returns:
+          - the Person record (name, role, email, aliases, appearance count)
+          - for each source they appear in: the source's full content,
+            up to max_sources.
+
+        Also returns recent action items they own (waiting-on items the
+        vault owner is owed) for context.
+        """
+        state = GlobalState.load(config.state_file)
+        if slug not in state.people:
+            # Try resolving by name
+            for p in state.people.values():
+                if p.name.lower() == slug.lower():
+                    slug = p.slug
+                    break
+            else:
+                return {"error": f"person '{slug}' not found"}
+        person = state.people[slug]
+
+        sources: list[dict] = []
+        for src_slug in person.appearances[-max_sources:]:
+            src_dir = config.wiki_sources / src_slug
+            if not src_dir.exists():
+                continue
+            parts = []
+            ov = src_dir / "_overview.md"
+            if ov.exists():
+                parts.append(ov.read_text())
+            for cp in sorted(src_dir.glob("chunk-*.md")):
+                parts.append(f"\n---\n\n## {cp.stem}\n" + cp.read_text())
+            sources.append({"slug": src_slug, "content": "\n".join(parts)})
+
+        open_waiting = [
+            _dump_action(a, state)
+            for a in state.action_items
+            if a.owner == slug and a.status == "open" and a.category == "waiting_on"
+        ]
+
+        return {
+            "slug": person.slug,
+            "name": person.name,
+            "email": person.email,
+            "role": person.role,
+            "aliases": person.aliases,
+            "current_summary": person.summary,
+            "total_appearances": len(person.appearances),
+            "new_appearances_since_summary": person.new_appearances_since_summary,
+            "first_seen": person.first_seen.isoformat() if person.first_seen else None,
+            "last_seen": person.last_seen.isoformat() if person.last_seen else None,
+            "sources": sources,
+            "open_waiting_on_them": open_waiting,
+        }
+
+    @mcp.tool()
+    def update_person_summary(slug: str, new_summary: str) -> dict:
+        """Replace the Summary section of a person page + reset the staleness counter.
+
+        Used after /refresh_person_summary: Claude reads the person via
+        get_person_full_context, writes a 2-4 paragraph synthesis of who
+        this person is to the vault owner (role, dynamics, recurring
+        themes, current state of the relationship), then calls this to
+        persist.
+        """
+        from deep_reader.steps import people as people_step
+        state = GlobalState.load(config.state_file)
+        if slug not in state.people:
+            return {"error": f"person '{slug}' not found"}
+        person = state.people[slug]
+        person.summary = new_summary.strip()
+        person.new_appearances_since_summary = 0
+        state.save(config.state_file)
+        people_step.render_person_page(person, state, config.wiki_people)
+        return {"slug": slug, "summary_chars": len(new_summary.strip())}
+
+    @mcp.tool()
+    def list_stale_person_summaries(min_new_appearances: int = 3) -> list[dict]:
+        """List people whose summaries are stale and worth regenerating.
+
+        A summary is stale if `new_appearances_since_summary` >= threshold
+        (default 3) OR if the person has no summary yet but has at least
+        one appearance.
+        """
+        state = GlobalState.load(config.state_file)
+        stale = []
+        for p in state.people.values():
+            no_summary = not (p.summary or "").strip()
+            if no_summary and p.appearances:
+                stale.append(p)
+                continue
+            if p.new_appearances_since_summary >= min_new_appearances:
+                stale.append(p)
+        stale.sort(key=lambda p: p.new_appearances_since_summary, reverse=True)
+        return [
+            {
+                "slug": p.slug,
+                "name": p.name,
+                "appearances": len(p.appearances),
+                "new_since_summary": p.new_appearances_since_summary,
+                "has_summary": bool((p.summary or "").strip()),
+            }
+            for p in stale
+        ]
+
+    @mcp.tool()
+    def list_concept_candidates(min_sources: int = 3) -> list[dict]:
+        """List concepts that appear in min_sources+ sources but don't yet
+        have a graduated concept article (or whose article is stale).
+
+        These are candidates for /compile_concepts to synthesize into
+        articles in /wiki/concepts/.
+        """
+        # Scan all chunk pages for [[concept-name]] in ## Concepts sections
+        state = GlobalState.load(config.state_file)
+        wiki = Wiki(config)
+        from collections import defaultdict
+        import re as _re
+        coverage: dict[str, set[str]] = defaultdict(set)
+        for slug in state.sources:
+            src_dir = config.wiki_sources / slug
+            for cp in src_dir.glob("chunk-*.md"):
+                page = cp.read_text()
+                # Find ## Concepts section
+                in_concepts = False
+                buf = []
+                for line in page.split("\n"):
+                    if line.startswith("## Concepts"):
+                        in_concepts = True
+                        continue
+                    if in_concepts and line.startswith("## "):
+                        break
+                    if in_concepts:
+                        buf.append(line)
+                section = "\n".join(buf)
+                for m in _re.finditer(r"\[\[([^\]]+)\]\]", section):
+                    coverage[m.group(1).strip().lower()].add(slug)
+
+        candidates = []
+        for name, sources in coverage.items():
+            if len(sources) >= min_sources:
+                article_path = config.wiki_concepts / f"{name}.md"
+                candidates.append({
+                    "name": name,
+                    "source_count": len(sources),
+                    "sources": sorted(sources),
+                    "has_article": article_path.exists(),
+                })
+        candidates.sort(key=lambda c: c["source_count"], reverse=True)
+        return candidates
+
+    @mcp.tool()
+    def get_concept_evidence(name: str) -> dict:
+        """Return all sources that tag this concept + their content.
+
+        Used before writing or refreshing a concept article. Returns
+        every source page where `[[<name>]]` appears in its Concepts
+        section, with full content.
+        """
+        state = GlobalState.load(config.state_file)
+        import re as _re
+        target = name.strip().lower()
+        matching_sources: list[dict] = []
+        for slug in state.sources:
+            src_dir = config.wiki_sources / slug
+            for cp in src_dir.glob("chunk-*.md"):
+                page = cp.read_text()
+                in_concepts = False
+                buf = []
+                for line in page.split("\n"):
+                    if line.startswith("## Concepts"):
+                        in_concepts = True
+                        continue
+                    if in_concepts and line.startswith("## "):
+                        break
+                    if in_concepts:
+                        buf.append(line)
+                section = "\n".join(buf)
+                if _re.search(r"\[\[" + _re.escape(target) + r"\]\]", section, _re.IGNORECASE):
+                    parts = []
+                    ov = src_dir / "_overview.md"
+                    if ov.exists():
+                        parts.append(ov.read_text())
+                    parts.append(f"\n---\n\n## {cp.stem}\n" + page)
+                    matching_sources.append({
+                        "slug": slug,
+                        "content": "\n".join(parts),
+                    })
+                    break
+        article_path = config.wiki_concepts / f"{name}.md"
+        existing_article = article_path.read_text() if article_path.exists() else ""
+        return {
+            "name": name,
+            "source_count": len(matching_sources),
+            "sources": matching_sources,
+            "existing_article": existing_article,
+        }
+
+    @mcp.tool()
+    def record_concept_article(name: str, content: str) -> dict:
+        """Write or replace a concept synthesis article at /wiki/concepts/{name}.md.
+
+        Used after /compile_concepts: Claude reads concept evidence via
+        get_concept_evidence, writes a synthesis article (definition,
+        how different sources approach it, agreements/tensions, open
+        questions), then calls this to persist.
+        """
+        from deep_reader.markdown import format_frontmatter
+        slug = name.strip().lower().replace(" ", "-")
+        path = config.wiki_concepts / f"{slug}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fm = {"name": name, "type": "concept"}
+        path.write_text(format_frontmatter(fm) + content.strip() + "\n")
+        return {"name": name, "slug": slug, "chars": len(content)}
+
+    @mcp.tool()
+    def get_digest_context(period: str, period_str: str) -> dict:
+        """Return everything that happened in a time window for digest writing.
+
+        period: "week" | "month" | "quarter"
+        period_str: e.g. "2026-W17", "2026-04", "2026-Q2"
+
+        Returns: sources completed in window, action items created in
+        window, threads with new evidence in window, top people by
+        appearance count in window.
+        """
+        from datetime import datetime as _dt, timedelta
+        state = GlobalState.load(config.state_file)
+
+        # Parse period_str into a window
+        try:
+            if period == "week":
+                # ISO week: "YYYY-Www"
+                year, wk = period_str.split("-W")
+                start = _dt.strptime(f"{year}-W{wk}-1", "%G-W%V-%u")
+                end = start + timedelta(days=7)
+            elif period == "month":
+                # "YYYY-MM"
+                y, m = period_str.split("-")
+                start = _dt(int(y), int(m), 1)
+                if int(m) == 12:
+                    end = _dt(int(y) + 1, 1, 1)
+                else:
+                    end = _dt(int(y), int(m) + 1, 1)
+            elif period == "quarter":
+                # "YYYY-QN"
+                y, q = period_str.split("-Q")
+                start_month = (int(q) - 1) * 3 + 1
+                start = _dt(int(y), start_month, 1)
+                end_month = start_month + 3
+                if end_month > 12:
+                    end = _dt(int(y) + 1, 1, 1)
+                else:
+                    end = _dt(int(y), end_month, 1)
+            else:
+                return {"error": f"unknown period '{period}' (use week/month/quarter)"}
+        except (ValueError, IndexError) as e:
+            return {"error": f"could not parse period_str '{period_str}': {e}"}
+
+        # Sources completed in window
+        sources_in_window = []
+        for slug, src in state.sources.items():
+            if src.completed_at and start <= src.completed_at < end:
+                sources_in_window.append({
+                    "slug": slug,
+                    "completed": src.completed_at.isoformat(),
+                    "type": src.source_type,
+                })
+
+        # Action items created in window
+        actions_in_window = [
+            _dump_action(a, state)
+            for a in state.action_items
+            if start <= a.created_at < end
+        ]
+
+        # Top people by appearance frequency in this window's sources
+        from collections import Counter
+        appearance_counter: Counter = Counter()
+        window_slugs = {s["slug"] for s in sources_in_window}
+        for p in state.people.values():
+            count = sum(1 for app in p.appearances if app in window_slugs)
+            if count:
+                appearance_counter[p.slug] = count
+        top_people = [
+            {"slug": slug, "name": state.people[slug].name, "appearances_this_period": cnt}
+            for slug, cnt in appearance_counter.most_common(15)
+        ]
+
+        return {
+            "period": period,
+            "period_str": period_str,
+            "window_start": start.isoformat(),
+            "window_end": end.isoformat(),
+            "sources": sources_in_window,
+            "action_items_created": actions_in_window,
+            "top_people": top_people,
+            "thread_names": state.global_threads,
+        }
+
+    @mcp.tool()
+    def record_digest(period: str, period_str: str, content: str) -> dict:
+        """Write a digest summary at /wiki/digests/{period}/{period_str}.md."""
+        from deep_reader.markdown import format_frontmatter
+        digests_dir = config.vault_root / "wiki" / "digests" / period
+        digests_dir.mkdir(parents=True, exist_ok=True)
+        path = digests_dir / f"{period_str}.md"
+        fm = {"period": period, "period_str": period_str, "type": "digest"}
+        path.write_text(format_frontmatter(fm) + content.strip() + "\n")
+        return {"path": str(path.relative_to(config.vault_root)), "chars": len(content)}
 
     @mcp.tool()
     def link_action_item(id: str, source_ref: str) -> dict:
@@ -1243,6 +1639,240 @@ present in the source, omit or pass [] for anything that isn't):
             "If the thread is light (a few messages, no real decisions), "
             "use `record_note(...)` instead of record_meeting — same "
             "fields minus attendees/decisions/date.\n"
+        )
+
+    # ---------- Synthesis-refresh prompts ----------
+    #
+    # These drive Claude through the "write a richer synthesis from
+    # accumulated evidence" pattern. They become more valuable as the
+    # vault grows past ~50 sources — when raw retrieval starts missing
+    # the cross-cutting story and synthesis articles become the right
+    # first stop for queries.
+
+    @mcp.prompt(
+        description=(
+            "Refresh a single thread's thesis — read its evidence, write "
+            "a richer multi-paragraph synthesis of how the topic has "
+            "developed across all the sources that touched it."
+        ),
+    )
+    def refresh_thread_synthesis(slug: str) -> str:
+        return (
+            f"Regenerate the thesis for thread '{slug}' from its full "
+            f"evidence log. Steps:\n"
+            "\n"
+            f"1. Call `get_thread_full_context(slug='{slug}')`. You'll "
+            "get the current thesis, the evidence log, and the full "
+            "content of every source page referenced in the evidence.\n"
+            "2. Read the evidence sources chronologically (they're "
+            "already in order). Trace how the topic has developed: "
+            "what was first established, what changed, what surprised, "
+            "what's still open.\n"
+            "3. Write a synthesis (3-5 paragraphs, ~300-500 words):\n"
+            "   - Lead with the current state in one tight paragraph.\n"
+            "   - A paragraph on how it got here — key inflection points "
+            "from the evidence, in chronological order.\n"
+            "   - A paragraph on tensions or open questions still active.\n"
+            "   - Optional: implications or what this connects to.\n"
+            "4. Call `update_thread_thesis(slug='" + slug + "', "
+            "new_thesis=<your text>)` to persist. Don't include "
+            "headers like '## Thesis' — just the body.\n"
+            "5. Confirm: report a one-line summary of what changed in "
+            "the thesis vs. before.\n"
+            "\n"
+            "Bias: paragraphs over bullet lists. The thesis should read "
+            "like an analyst's brief, not a search result. Quote or "
+            "paraphrase specific evidence; don't make claims the sources "
+            "don't support."
+        )
+
+    @mcp.prompt(
+        description=(
+            "Refresh ALL thread theses — walks every thread with at "
+            "least 3 evidence entries and regenerates its synthesis. "
+            "Run periodically (weekly is fine)."
+        ),
+    )
+    def refresh_all_thread_syntheses(min_evidence: int = 3) -> str:
+        return (
+            "Bulk-refresh every thread thesis. Steps:\n"
+            "\n"
+            "1. Use `vault://summary` and existing tools to enumerate "
+            "the active threads. (Or call `search(query='', depth='lite', "
+            "limit=50)` and inspect the threads list — but better, just "
+            "ask me which threads to refresh if there are many.)\n"
+            "2. For each thread:\n"
+            "   a. Call `get_thread_full_context(slug=...)`.\n"
+            "   b. Skip if `evidence_source_count` < "
+            f"{min_evidence} — too thin to synthesize meaningfully.\n"
+            "   c. Otherwise, write a 3-5 paragraph synthesis and call "
+            "`update_thread_thesis(...)` to persist.\n"
+            "3. Report at the end: how many were refreshed, how many "
+            "skipped as too thin.\n"
+            "\n"
+            "Take your time per thread — this is meant to be a quality "
+            "pass, not a speed run. If 10+ threads need refresh, do "
+            "them in two batches and ask me which to prioritize."
+        )
+
+    @mcp.prompt(
+        description=(
+            "Refresh a single person's summary — read their full "
+            "interaction history and write a synthesis of who they are "
+            "in the vault."
+        ),
+    )
+    def refresh_person_summary(name: str) -> str:
+        return (
+            f"Regenerate the summary for {name}. Steps:\n"
+            "\n"
+            f"1. Call `get_person_full_context(slug='{name}')` — pass "
+            "either the slug or the full name; the tool will resolve.\n"
+            "2. Read every source where this person appears. Look for: "
+            "their role, recurring themes when they show up, the dynamic "
+            "between them and the vault owner, what's open with them.\n"
+            "3. Write a 2-4 paragraph summary:\n"
+            "   - Who they are (role, organization, relationship).\n"
+            "   - Recurring themes / patterns across appearances.\n"
+            "   - Current state — what's open, what's been resolved, "
+            "what they're working on.\n"
+            "   - Optional: stylistic / personality notes if visible "
+            "from sources (e.g., 'tends to push back hard on price', "
+            "'asks for written followups').\n"
+            "4. Call `update_person_summary(slug=<slug from step 1>, "
+            "new_summary=<your text>)`. Don't include the '## Summary' "
+            "header — just the body.\n"
+            "5. Confirm: report what's now in the summary.\n"
+            "\n"
+            "Bias toward grounded specifics over generic descriptions. "
+            "Reference particular sources or quotes if they illustrate "
+            "a pattern."
+        )
+
+    @mcp.prompt(
+        description=(
+            "Refresh stale person summaries — finds people with 3+ new "
+            "appearances since their last summary and regenerates each."
+        ),
+    )
+    def refresh_stale_person_summaries(min_new_appearances: int = 3) -> str:
+        return (
+            f"Bulk-refresh stale person summaries. Steps:\n"
+            "\n"
+            f"1. Call `list_stale_person_summaries(min_new_appearances="
+            f"{min_new_appearances})` to get the list.\n"
+            "2. For each person on the list, run the refresh "
+            "(equivalent to refresh_person_summary):\n"
+            "   a. `get_person_full_context(slug=<their slug>)`\n"
+            "   b. Synthesize a 2-4 paragraph summary as described in "
+            "refresh_person_summary's docs.\n"
+            "   c. `update_person_summary(slug, new_summary)`\n"
+            "3. Report at the end: how many refreshed, with a one-line "
+            "before/after for each.\n"
+            "\n"
+            "If the list has more than 5 people, ask me which to "
+            "prioritize — quality matters more than coverage here."
+        )
+
+    @mcp.prompt(
+        description=(
+            "Compile or refresh concept articles — finds concepts that "
+            "appear in 3+ sources and writes synthesis articles in "
+            "/wiki/concepts/."
+        ),
+    )
+    def compile_concepts(min_sources: int = 3, force: bool = False) -> str:
+        force_flag = ", regardless of whether they already have articles" if force else ""
+        return (
+            f"Compile concept articles for concepts that appear in "
+            f"{min_sources}+ sources{force_flag}. Steps:\n"
+            "\n"
+            f"1. Call `list_concept_candidates(min_sources={min_sources})`.\n"
+            "2. For each candidate (skip those with `has_article=true` "
+            "unless I asked you to force-refresh):\n"
+            "   a. `get_concept_evidence(name=<concept>)` — returns "
+            "every source that tags this concept with full content.\n"
+            "   b. Write a synthesis article (~400-700 words) "
+            "structured as:\n"
+            "      - Definition (1 paragraph)\n"
+            "      - How different sources approach this — agreements, "
+            "tensions, contradictions across the corpus\n"
+            "      - Synthesis: a unified understanding given all the "
+            "evidence\n"
+            "      - Open questions / where the concept is still evolving\n"
+            "      - Related concepts (if any [[wiki-links]] make sense)\n"
+            "      - Contributing sources (list of [[<source-slug>]])\n"
+            "   c. `record_concept_article(name=<concept>, "
+            "content=<article>)`\n"
+            "3. Report: how many articles created, how many skipped "
+            "(already exist), top recurring themes you noticed across "
+            "concepts.\n"
+            "\n"
+            "Concept articles should feel like the synthesis of an "
+            "analyst who's read everything in the vault on this topic, "
+            "not a stitching-together of source quotes."
+        )
+
+    @mcp.prompt(
+        description=(
+            "Generate a weekly digest of vault activity — sources, "
+            "action items, threads advanced, top people. Defaults to "
+            "the current ISO week."
+        ),
+    )
+    def digest_week(period_str: str = "this-week") -> str:
+        return (
+            f"Generate a weekly digest for {period_str}. Steps:\n"
+            "\n"
+            "1. Resolve the period_str. If it's 'this-week' or empty, "
+            "use the current ISO week as 'YYYY-Www'. Otherwise expect "
+            "the format 'YYYY-Www' (ISO 8601).\n"
+            "2. Call `get_digest_context(period='week', "
+            "period_str=<resolved>)` for the underlying data.\n"
+            "3. Write a digest (~300-500 words):\n"
+            "   - Opening: one paragraph capturing the week's shape.\n"
+            "   - Top themes: 3-5 bullets, each a short paragraph "
+            "synthesizing a thread or recurring topic, citing the "
+            "sources that touched it.\n"
+            "   - People: who was most active, any new entries to the "
+            "vault.\n"
+            "   - Open at week's end: what's still on my list, what "
+            "I'm waiting on.\n"
+            "   - One-line reflection: what to carry into next week.\n"
+            "4. Call `record_digest(period='week', period_str=<resolved>, "
+            "content=<your digest>)` to persist.\n"
+            "5. Show me the digest in chat as well as filing it.\n"
+            "\n"
+            "Synthesis over enumeration — don't list every source, "
+            "highlight the ones that mattered."
+        )
+
+    @mcp.prompt(
+        description=(
+            "Generate a monthly digest. Defaults to the current month."
+        ),
+    )
+    def digest_month(period_str: str = "this-month") -> str:
+        return (
+            f"Generate a monthly digest for {period_str}. Steps:\n"
+            "\n"
+            "1. Resolve period_str — 'this-month' / empty → current "
+            "month as 'YYYY-MM'. Otherwise expect 'YYYY-MM'.\n"
+            "2. `get_digest_context(period='month', period_str=...)`.\n"
+            "3. Write a longer digest than weekly (~600-1000 words):\n"
+            "   - Month in one paragraph.\n"
+            "   - Threads that advanced significantly — for each, a "
+            "paragraph on what changed and where it stands now.\n"
+            "   - People dynamics — who came up most, new relationships, "
+            "shifting patterns.\n"
+            "   - Action items: what closed, what's still open and aging.\n"
+            "   - Pattern observations — anything you notice across the "
+            "month that wasn't obvious in any single week.\n"
+            "4. `record_digest(period='month', ...)` to persist.\n"
+            "5. Show in chat.\n"
+            "\n"
+            "If the month had < 5 sources, say so and offer a smaller "
+            "digest rather than padding."
         )
 
     @mcp.prompt(

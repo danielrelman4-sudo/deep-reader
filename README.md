@@ -113,6 +113,21 @@ Use the `/quick_scan <term>` slash command when you just want to see what source
 | `list_action_items` / `list_waiting_on` | Your to-do list / items owed by others |
 | `add_action_item` / `add_waiting_on` / `close_action_item` | Action-item CRUD. Exact-description dedup auto-appends new sources to `additional_sources`. Mutations re-render the affected person pages + central lists. |
 | `link_action_item(id, source_ref)` | Attach an additional source reference to an existing item. For paraphrase dedup — when Slack mentions a commitment already captured from a meeting. |
+
+**Synthesis layer (continuously-maintained syntheses for chat at scale):**
+
+| Tool | Purpose |
+|---|---|
+| `get_thread_full_context(slug)` | Thread + content of every source in its evidence log. Used before regenerating a thesis. |
+| `update_thread_thesis(slug, new_thesis)` | Replace just the Thesis section, preserve Evidence + Status |
+| `get_person_full_context(slug)` | Person record + content of every source they appear in + their open waiting-on items |
+| `update_person_summary(slug, new_summary)` | Replace just the Summary section + reset staleness counter |
+| `list_stale_person_summaries(min_new_appearances=3)` | People with N+ new appearances since last summary regen |
+| `list_concept_candidates(min_sources=3)` | Concepts in 3+ sources eligible to graduate to articles |
+| `get_concept_evidence(name)` | Every source that tags this concept, with content |
+| `record_concept_article(name, content)` | Write/replace `/wiki/concepts/{name}.md` |
+| `get_digest_context(period, period_str)` | Sources, actions, people active in a given week / month / quarter |
+| `record_digest(period, period_str, content)` | Write a digest to `/wiki/digests/{period}/{period_str}.md` |
 | `list_people` / `get_person` / `merge_people` | People directory |
 | `forget_source(slug)` | Remove a source's page, state, attributed action items, and thread evidence. Raw file preserved. |
 | `recap_prep` / `sync_recap` | Daily-recap skill integration |
@@ -147,8 +162,24 @@ Prefer the `record_*` tools — the legacy tools exist for users running their o
 | `/quick_scan(term)` | Lightweight scan — no synthesis, just what the vault has on a term |
 | `/deep_query(question)` | Force deep retrieve-then-synthesize pattern. Usually unnecessary (default `search` already does this) — fallback if Claude ever answers from snippets. |
 | `/catch_me_up` | Concise brief of open items, recent activity, one thing to do next |
+| `/refresh_thread_synthesis(slug)` | Rewrite a thread's thesis as a richer multi-paragraph synthesis from its full evidence |
+| `/refresh_all_thread_syntheses` | Bulk version — walks threads with 3+ evidence entries |
+| `/refresh_person_summary(name)` | Generate / refresh a person's summary from all sources they appear in |
+| `/refresh_stale_person_summaries` | Bulk — finds people with 3+ new appearances since their last summary |
+| `/compile_concepts` | Find concepts in 3+ sources and synthesize concept articles in `/wiki/concepts/` |
+| `/digest_week(period_str?)` | Generate a weekly digest (defaults to current ISO week) |
+| `/digest_month(period_str?)` | Generate a monthly digest (defaults to current month) |
 
 The `/ingest_granola_*` prompts require Granola's own MCP server to be registered alongside this one (see "Granola integration" below). The `/ingest_slack_*` prompts require a Slack MCP server.
+
+### When to run synthesis-refresh prompts
+
+The `/refresh_*` and `/digest_*` prompts produce continuously-maintained syntheses that scale better than raw retrieval as the vault grows past ~50 sources. They're cheap to run and don't break anything if the vault is small — but they don't add much value at scale 0–30. Suggested cadence:
+
+- Weekly: `/refresh_stale_person_summaries`, `/digest_week`
+- Monthly: `/refresh_all_thread_syntheses`, `/compile_concepts`, `/digest_month`
+
+You don't need to do these as Nicole — she'll grow into them. They're here for when the vault feels file-system-y.
 
 ### Typed schema for structured tools
 

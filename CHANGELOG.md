@@ -38,6 +38,14 @@ Redesigned for a cross-functional operator as the primary user. Original book-re
   - `/ingest_slack_thread` — ingests a specific Slack thread as a meeting-analog source (attendees, decisions, action items, threads).
 - All three reuse existing `record_note` / `record_meeting` / `add_action_item` / `add_waiting_on` flows — no new persistence logic.
 
+### Synthesis layer for chat at scale
+- New retrieval pattern: as the vault grows, raw-source retrieval scales poorly because the right hits stop being in the top-N. The fix is a continuously-maintained synthesis layer (richer thread theses, person summaries, concept articles, time-windowed digests) that Claude reads from, regenerated periodically from accumulated evidence.
+- Search default `inline_top_n` bumped from 3 → 5 (override via parameter; capped at 20). Token cost goes from ~2.7K to ~4.5K per call — comfortable budget, broader coverage.
+- 10 new MCP tools to support synthesis: `get_thread_full_context`, `update_thread_thesis`, `get_person_full_context`, `update_person_summary`, `list_stale_person_summaries`, `list_concept_candidates`, `get_concept_evidence`, `record_concept_article`, `get_digest_context`, `record_digest`. All are no-API-key — Claude does the synthesis in chat, tools fetch context and persist results.
+- 7 new MCP prompts driving the workflows: `/refresh_thread_synthesis(slug)`, `/refresh_all_thread_syntheses`, `/refresh_person_summary(name)`, `/refresh_stale_person_summaries`, `/compile_concepts`, `/digest_week([period])`, `/digest_month([period])`.
+- Concept compilation now lives entirely in the no-API-key flow — the legacy `tools/compile_concepts.py` (server-side LLM, requires API key) is preserved but no longer the primary path.
+- Digests written to a new `/wiki/digests/{period}/{period_str}.md` directory.
+
 ### Cross-source action-item dedup
 - `ActionItem` gains `additional_sources: list[str]` for tracking re-mentions of the same commitment across sources. Backward-compatible (default empty list).
 - `add_mine` / `add_waiting_on` / `add_other`: on exact-description dedup, append the new source to `additional_sources` instead of silently dropping it. Provenance preserved.
