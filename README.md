@@ -114,22 +114,56 @@ Use the `/quick_scan <term>` slash command when you just want to see what source
 | `add_action_item` / `add_waiting_on` / `close_action_item` | Action-item CRUD. Exact-description dedup auto-appends new sources to `additional_sources`. Mutations re-render the affected person pages + central lists. |
 | `link_action_item(id, source_ref)` | Attach an additional source reference to an existing item. For paraphrase dedup — when Slack mentions a commitment already captured from a meeting. |
 
-**Synthesis layer (continuously-maintained syntheses for chat at scale):**
+**Indexing / routing (structural pointers, no paraphrased content):**
 
 | Tool | Purpose |
 |---|---|
-| `get_thread_full_context(slug)` | Thread + content of every source in its evidence log. Used before regenerating a thesis. |
-| `update_thread_thesis(slug, new_thesis)` | Replace just the Thesis section, preserve Evidence + Status |
-| `get_person_full_context(slug)` | Person record + content of every source they appear in + their open waiting-on items |
-| `update_person_summary(slug, new_summary)` | Replace just the Summary section + reset staleness counter |
-| `list_stale_person_summaries(min_new_appearances=3)` | People with N+ new appearances since last summary regen |
-| `list_concept_candidates(min_sources=3)` | Concepts in 3+ sources eligible to graduate to articles |
-| `get_concept_evidence(name)` | Every source that tags this concept, with content |
-| `record_concept_article(name, content)` | Write/replace `/wiki/concepts/{name}.md` |
-| `get_digest_context(period, period_str)` | Sources, actions, people active in a given week / month / quarter |
-| `record_digest(period, period_str, content)` | Write a digest to `/wiki/digests/{period}/{period_str}.md` |
+| `find_related(slug)` | Entities most-connected to a source/person/thread/concept |
+| `who_knows_about(topic)` | People ranked by source-overlap with a thread or concept |
+| `overlap(a, b)` | Shared sources/threads between two entities |
+| `timeline(person?, thread?, concept?, since_days?)` | Chronological event stream |
+| `coverage(slug)` | Sources, people, time range contributing to a thread or concept |
+| `recent_activity(slug, since_days?)` | What's happened around an entity recently |
+| `connections_between(a, b)` | Path / shared context linking two entities |
+
+**Concept hierarchy + distillation (concepts are the synthesis exception):**
+
+| Tool | Purpose |
+|---|---|
+| `link_concepts(parent, child, kind)` | Establish hierarchy or related-to relationship |
+| `unlink_concepts(a, b)` | Remove relationships |
+| `get_concept_with_hierarchy(name, depth)` | Concept + parent chain + children + related |
+| `list_stale_concepts(min_new_sources)` | Concepts due for refresh based on new source coverage |
+| `list_concept_candidates(min_sources)` | Concepts in N+ sources |
+| `get_concept_evidence(name)` | Every source tagging this concept, with content |
+| `record_concept_page(name, definition, distillation, ...)` | Write/replace concept page. Concept pages allow prose synthesis (the only place); require source citations + quotes |
+| `get_thread_full_context(slug)` | Thread + content of every source in its evidence log |
+| `get_person_full_context(slug)` | Person record + content of every source they appear in |
+
+**Review queue (Claude proposes, you approve):**
+
+| Tool | Purpose |
+|---|---|
+| `propose_review(kind, title, preview, proposed_action)` | Queue an action for user approval |
+| `list_pending_reviews(kind?)` | Items waiting for your decision |
+| `get_review(id)` | Full details of a single review including the proposed action |
+| `approve_review(id)` | Execute the proposed action |
+| `reject_review(id, reason?)` | Mark rejected without executing |
+
+**Drive integration:**
+
+| Tool | Purpose |
+|---|---|
+| `is_drive_ingested(drive_id)` | Has this Drive doc already been ingested? |
+| `mark_drive_ingested(drive_id, source_slug)` | Track a newly-ingested doc to prevent re-crawl |
+| `list_drive_ingested` | All tracked Drive doc IDs |
+
+**People / sources / maintenance:**
+
+| Tool | Purpose |
+|---|---|
 | `list_people` / `get_person` / `merge_people` | People directory |
-| `forget_source(slug)` | Remove a source's page, state, attributed action items, and thread evidence. Raw file preserved. |
+| `forget_source(slug)` | Remove a source's page, state, attributed action items, thread evidence. Raw preserved. |
 | `recap_prep` / `sync_recap` | Daily-recap skill integration |
 | `list_inbox` | See what's waiting to be processed |
 
@@ -144,7 +178,7 @@ Prefer the `record_*` tools — the legacy tools exist for users running their o
 
 ### Available resources
 
-`vault://summary` · `vault://action_items` · `vault://waiting_on` · `vault://people` · `vault://people/{slug}` · `vault://sources/{slug}` (full content, overview + chunks) · `vault://threads/{name}` · `vault://recaps/{date}` · `vault://inbox`
+`vault://summary` · `vault://action_items` · `vault://waiting_on` · `vault://people` · `vault://people/{slug}` · `vault://sources/{slug}` (full content, overview + chunks) · `vault://threads/{name}` · `vault://recaps/{date}` · `vault://inbox` · `vault://review_pending`
 
 ### Available prompts (slash commands in Claude Desktop)
 
@@ -162,24 +196,36 @@ Prefer the `record_*` tools — the legacy tools exist for users running their o
 | `/quick_scan(term)` | Lightweight scan — no synthesis, just what the vault has on a term |
 | `/deep_query(question)` | Force deep retrieve-then-synthesize pattern. Usually unnecessary (default `search` already does this) — fallback if Claude ever answers from snippets. |
 | `/catch_me_up` | Concise brief of open items, recent activity, one thing to do next |
-| `/refresh_thread_synthesis(slug)` | Rewrite a thread's thesis as a richer multi-paragraph synthesis from its full evidence |
-| `/refresh_all_thread_syntheses` | Bulk version — walks threads with 3+ evidence entries |
-| `/refresh_person_summary(name)` | Generate / refresh a person's summary from all sources they appear in |
-| `/refresh_stale_person_summaries` | Bulk — finds people with 3+ new appearances since their last summary |
-| `/compile_concepts` | Find concepts in 3+ sources and synthesize concept articles in `/wiki/concepts/` |
-| `/digest_week(period_str?)` | Generate a weekly digest (defaults to current ISO week) |
-| `/digest_month(period_str?)` | Generate a monthly digest (defaults to current month) |
+| `/refresh_concept(name)` | Re-read sources tagging a concept and queue an updated page for review (concept pages = the synthesis exception) |
+| `/list_stale` | Survey vault for stale concept pages, queue refreshes |
+| `/suggest_concept_links` | Propose hierarchy you might be missing (parent/child/related) |
+| `/backfill_drive(folder?)` | One-time backfill from a Google Drive folder (requires Drive MCP) |
+| `/crawl_drive(since?)` | Incremental Drive crawl — modified since last sync |
+| `/enrich_concept(name)` | Find Drive/Linear material related to a concept, queue ingestions |
+| `/enrich_thread(slug)` | Same for threads |
+| `/enrich_person(name)` | Same for people |
+| `/review_pending` | Walk through the review queue interactively |
 
 The `/ingest_granola_*` prompts require Granola's own MCP server to be registered alongside this one (see "Granola integration" below). The `/ingest_slack_*` prompts require a Slack MCP server.
 
-### When to run synthesis-refresh prompts
+### Design principle: source canonical, index structural, concept pages are the only synthesis
 
-The `/refresh_*` and `/digest_*` prompts produce continuously-maintained syntheses that scale better than raw retrieval as the vault grows past ~50 sources. They're cheap to run and don't break anything if the vault is small — but they don't add much value at scale 0–30. Suggested cadence:
+The earlier synthesis layer (auto-generated thread/person summaries, weekly digests) was removed. Auto-generated prose summaries dilute source material and pollute the knowledge base with low-quality derivatives that compete with originals for retrieval. Replaced with:
 
-- Weekly: `/refresh_stale_person_summaries`, `/digest_week`
-- Monthly: `/refresh_all_thread_syntheses`, `/compile_concepts`, `/digest_month`
+1. **Source content stays canonical.** Sources, threads, people pages, action items — none of these are ever paraphrased into summary prose by the system.
+2. **The index is structural, not synthetic.** As the vault grows, scale comes from better routing (relationship tools: `find_related`, `who_knows_about`, `coverage`, `timeline`, etc.) — Claude uses the index to figure out *which* sources matter, then reads actual content. The map gets richer; the territory stays untouched.
+3. **Concept pages are the one synthesis exception.** Concepts are meta-entities that exist only as integrations across sources, so distilling them is what makes them useful. Strict rules: heavy `[[<source-slug>]]` citations + direct quotes (no abstract paraphrase), editable by hand, refreshed only via the review queue (Claude proposes → you approve).
+4. **Concepts have hierarchy.** Parent / child / related relationships. When discussing a child concept, the system pulls parent context too. Built via `link_concepts` or auto-suggested via `/suggest_concept_links`.
+5. **Review queue gates persistent changes.** Concept refreshes, hierarchy suggestions, Drive ingest candidates → all queue to `/wiki/_review/pending.md` and surface in `vault://summary`. Approve in chat (*"approve abc123"*) → action executes. Never silently mutates structural files.
 
-You don't need to do these as Nicole — she'll grow into them. They're here for when the vault feels file-system-y.
+### When to run the prompts
+
+You don't need any of these at small vault scale (0–30 sources). They become useful as content accumulates:
+
+- As you ingest content: nothing else needed — concepts auto-tag, the index updates from state.
+- Weekly-ish: `/list_stale` for stale concepts, `/review_pending` to walk the queue.
+- Monthly-ish: `/suggest_concept_links` to catch hierarchy you missed.
+- On demand: `/enrich_concept(name)` when you want to actively pull more material for a topic; `/backfill_drive(folder)` for Drive seeding.
 
 ### Typed schema for structured tools
 

@@ -124,6 +124,52 @@ class ActionItem(BaseModel):
     additional_sources: List[str] = Field(default_factory=list)
 
 
+class Concept(BaseModel):
+    """A first-class concept entity with hierarchy + freshness tracking.
+
+    Concepts are unique among synthesis-eligible artifacts: they're meta-
+    entities that ONLY exist as integrations across sources. So unlike
+    threads / people / sources (which never get prose synthesis), concept
+    pages CAN have a definition + distillation. Constraints apply (heavy
+    citations, hand-editable, refresh-on-demand-not-auto).
+    """
+    slug: str
+    name: str
+    parent_concepts: List[str] = Field(default_factory=list)
+    child_concepts: List[str] = Field(default_factory=list)
+    related_concepts: List[str] = Field(default_factory=list)
+    # Number of sources tagging this concept at last refresh of its page
+    # (used to surface "due for refresh" without auto-regenerating).
+    sources_at_last_refresh: int = 0
+    last_refreshed: Optional[datetime] = None
+
+
+class ReviewItem(BaseModel):
+    """An action proposed by Claude that's queued for the user's approval.
+
+    Used for batch / async / not-immediately-decidable workflows:
+      - concept page refreshes (proposed page replacement diffs)
+      - concept hierarchy suggestions
+      - Drive / Linear ingest candidates (proposed enrichments)
+      - borderline-relevance docs found during /crawl_drive
+    """
+    id: str
+    kind: str  # concept_refresh | concept_link | enrichment_ingest | drive_borderline | etc
+    title: str  # human-readable summary
+    preview: str  # multi-line description / diff for the user
+    proposed_action: dict  # serialized {tool, args} for execution on approval
+    created_at: datetime
+    status: str = "pending"  # pending | approved | rejected | expired
+    reviewed_at: Optional[datetime] = None
+
+
+class DriveTracking(BaseModel):
+    """Track which Drive doc IDs have been ingested into the vault."""
+    # drive_id -> source_slug
+    ingested_ids: Dict[str, str] = Field(default_factory=dict)
+    last_crawl_at: Optional[datetime] = None
+
+
 class GlobalState(BaseModel):
     """Top-level state saved to _state.json."""
     sources: Dict[str, SourceState] = Field(default_factory=dict)
@@ -132,6 +178,17 @@ class GlobalState(BaseModel):
     people: Dict[str, Person] = Field(default_factory=dict)
     action_items: List[ActionItem] = Field(default_factory=list)
     owner: VaultOwner = Field(default_factory=VaultOwner)
+    # First-class concept entities (hierarchy + freshness). Backward
+    # compatible — defaults empty for existing vaults. Concepts are
+    # populated lazily as they're tagged on sources or have hierarchy
+    # established via link_concepts.
+    concepts: Dict[str, Concept] = Field(default_factory=dict)
+    # Pending-review queue for actions Claude proposes but waits for
+    # user approval before executing.
+    review_queue: List[ReviewItem] = Field(default_factory=list)
+    # Drive ingestion tracking — prevents re-ingesting the same Drive
+    # doc on a re-crawl.
+    drive: DriveTracking = Field(default_factory=DriveTracking)
 
     def save(self, path: Path) -> None:
         path.write_text(self.model_dump_json(indent=2))

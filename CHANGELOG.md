@@ -38,13 +38,55 @@ Redesigned for a cross-functional operator as the primary user. Original book-re
   - `/ingest_slack_thread` — ingests a specific Slack thread as a meeting-analog source (attendees, decisions, action items, threads).
 - All three reuse existing `record_note` / `record_meeting` / `add_action_item` / `add_waiting_on` flows — no new persistence logic.
 
-### Synthesis layer for chat at scale
-- New retrieval pattern: as the vault grows, raw-source retrieval scales poorly because the right hits stop being in the top-N. The fix is a continuously-maintained synthesis layer (richer thread theses, person summaries, concept articles, time-windowed digests) that Claude reads from, regenerated periodically from accumulated evidence.
-- Search default `inline_top_n` bumped from 3 → 5 (override via parameter; capped at 20). Token cost goes from ~2.7K to ~4.5K per call — comfortable budget, broader coverage.
-- 10 new MCP tools to support synthesis: `get_thread_full_context`, `update_thread_thesis`, `get_person_full_context`, `update_person_summary`, `list_stale_person_summaries`, `list_concept_candidates`, `get_concept_evidence`, `record_concept_article`, `get_digest_context`, `record_digest`. All are no-API-key — Claude does the synthesis in chat, tools fetch context and persist results.
-- 7 new MCP prompts driving the workflows: `/refresh_thread_synthesis(slug)`, `/refresh_all_thread_syntheses`, `/refresh_person_summary(name)`, `/refresh_stale_person_summaries`, `/compile_concepts`, `/digest_week([period])`, `/digest_month([period])`.
-- Concept compilation now lives entirely in the no-API-key flow — the legacy `tools/compile_concepts.py` (server-side LLM, requires API key) is preserved but no longer the primary path.
-- Digests written to a new `/wiki/digests/{period}/{period_str}.md` directory.
+### Indexing layer + concept hierarchy + review queue (replaces synthesis layer)
+
+The earlier synthesis layer was wrong — auto-generating prose summaries on top of source material diluted what was actually in the vault and risked retrieval pulling from low-quality derivatives. Replaced with a structural indexing approach + concept hierarchy + user-approved synthesis only for concept pages (the one synthesis exception, since concepts ARE meta-integrations across sources).
+
+**Removed** (synthesis layer): `update_thread_thesis`, `update_person_summary`, `record_concept_article`, `get_digest_context`, `record_digest`, `list_stale_person_summaries`. Removed prompts: `/refresh_thread_synthesis`, `/refresh_all_thread_syntheses`, `/refresh_person_summary`, `/refresh_stale_person_summaries`, `/compile_concepts`, `/digest_week`, `/digest_month`.
+
+**Added — Indexing / routing tools** (return structural pointers, never paraphrased content):
+- `find_related(slug)` — entities most-connected to a source/person/thread/concept
+- `who_knows_about(topic)` — people ranked by source-overlap with a thread or concept
+- `overlap(a, b)` — shared sources/threads between two entities
+- `timeline(person?, thread?, concept?, since_days?)` — chronological event stream
+- `coverage(slug)` — sources, people, time range contributing to a thread or concept
+- `recent_activity(slug, since_days?)` — what's happened around an entity
+- `connections_between(a, b)` — path / shared context linking two entities
+
+**Added — Concept hierarchy** (concepts as first-class state entities):
+- `Concept` model: parent_concepts, child_concepts, related_concepts + freshness tracking
+- `link_concepts(parent, child, kind)` / `unlink_concepts(a, b)` — establish/remove relationships
+- `get_concept_with_hierarchy(name, depth)` — concept + recursive parent chain + children + related
+- `list_stale_concepts(min_new_sources)` — concepts due for refresh based on new source coverage
+
+**Added — Concept page distillation** (the one synthesis exception):
+- `record_concept_page(name, definition, distillation, contributing_sources, hierarchy?, tensions?)` — structured intake. Concept pages CAN be prose synthesis since concepts are meta-entities; required to use direct `[[<source-slug>]]` citations and quotes, not abstract paraphrase.
+
+**Added — Review queue** (Claude proposes, user approves before persistence):
+- `ReviewItem` state model + `pending_reviews: list[ReviewItem]` on GlobalState
+- Tools: `propose_review(kind, title, preview, proposed_action)`, `list_pending_reviews(kind?)`, `get_review(id)`, `approve_review(id)`, `reject_review(id, reason?)`
+- Renders to `/wiki/_review/pending.md` (auto-updated)
+- `vault://review_pending` resource + `vault://summary` includes pending count
+- Concept refreshes, hierarchy suggestions, Drive ingest candidates all flow through the queue
+
+**Added — Drive integration**:
+- `DriveTracking` state (drive_id → source_slug + last_crawl_at)
+- `is_drive_ingested(drive_id)` / `mark_drive_ingested` / `list_drive_ingested`
+- Prompts: `/backfill_drive(folder?)` for one-time seeding, `/crawl_drive(since?)` for incremental delta
+- Borderline-relevance docs go to the review queue
+
+**Added — Proactive enrichment prompts**:
+- `/enrich_concept(name)` — finds Drive/Linear material related to a concept, queues each as a review
+- `/enrich_thread(slug)` — same for threads
+- `/enrich_person(name)` — same for people
+
+**Added — Concept distillation prompts**:
+- `/refresh_concept(name)` — re-reads sources, queues a review with the proposed page
+- `/list_stale` — survey vault for stale concepts, propose refreshes
+- `/suggest_concept_links` — propose hierarchy you might be missing
+- `/review_pending` — walk through the queue interactively
+
+**Search**: default `inline_top_n` stays at 5 (bumped earlier).
 
 ### Cross-source action-item dedup
 - `ActionItem` gains `additional_sources: list[str]` for tracking re-mentions of the same commitment across sources. Backward-compatible (default empty list).

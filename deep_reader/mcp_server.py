@@ -119,8 +119,14 @@ def build_server(vault_root: Path):
         open_waiting = sum(
             1 for a in state.action_items if a.category == "waiting_on" and a.status == "open"
         )
+        pending_reviews = sum(1 for r in state.review_queue if r.status == "pending")
         lines.append(f"- Open action items: {open_mine}")
         lines.append(f"- Waiting on: {open_waiting}")
+        if pending_reviews:
+            lines.append(
+                f"- **Pending reviews: {pending_reviews}** "
+                f"(see `vault://review_pending` or run `/review_pending` in chat)"
+            )
         if state.owner.name:
             lines.append(f"- Owner: {state.owner.name} <{state.owner.email}>")
         # Recent sources
@@ -206,6 +212,13 @@ def build_server(vault_root: Path):
             return f"# Recap {when}\n\n_(not found)_\n"
         return path.read_text()
 
+    @mcp.resource("vault://review_pending")
+    def review_pending_resource() -> str:
+        path = config.vault_root / "wiki" / "_review" / "pending.md"
+        if path.exists():
+            return path.read_text()
+        return "# Pending Reviews\n\n_(nothing waiting)_\n"
+
     @mcp.resource("vault://inbox")
     def inbox_list() -> str:
         if not config.inbox.exists():
@@ -221,6 +234,604 @@ def build_server(vault_root: Path):
         return "\n".join(lines)
 
     # ---------- Tools ----------
+
+    # ---------- Index / routing tools ----------
+    #
+    # These compute relationships from existing state. They return
+    # structural pointers (slugs, counts, dates) — never paraphrased
+    # content. Claude uses them to figure out WHICH source/thread/person
+    # to read, then loads the actual content via get_source / search.
+
+    @mcp.tool()
+    def find_related(slug: str, limit: int = 10) -> dict:
+        """Return entities most-connected to the given slug.
+
+        Auto-detects entity type (source / person / thread / concept). For:
+          - source → co-attendees, threads it advanced, concepts tagged
+          - person → sources they appear in, threads they're central to,
+            people they co-appear with most
+          - thread → contributing sources, central people, related threads
+            (sharing 2+ sources), concepts the thread touches
+          - concept → contributing sources, parent/child/related concepts,
+            central people, threads advancing it
+        """
+        state = GlobalState.load(config.state_file)
+        # Resolve type
+        if slug in state.sources:
+            return _related_for_source(state, slug, limit)
+        if slug in state.people:
+            return _related_for_person(state, slug, limit)
+        if slug in state.global_threads:
+            return _related_for_thread(state, slug, config, limit)
+        if slug in state.concepts:
+            return _related_for_concept(state, slug, config, limit)
+        # Try concept by lowercase
+        slug_l = slug.lower()
+        if slug_l in state.concepts:
+            return _related_for_concept(state, slug_l, config, limit)
+        return {"error": f"slug '{slug}' not found as source/person/thread/concept"}
+
+    @mcp.tool()
+    def who_knows_about(topic: str, limit: int = 10) -> list[dict]:
+        """Rank people by source-overlap with a topic (thread or concept).
+
+        Resolves topic to a thread or concept, then counts each person's
+        appearances in sources contributing to that topic.
+        """
+        state = GlobalState.load(config.state_file)
+        # Resolve topic to set of contributing source slugs
+        contributing: set[str] = set()
+        topic_l = topic.lower().replace(" ", "-")
+        if topic_l in state.global_threads:
+            # Source slugs appearing in the thread's evidence
+            thread_path = config.wiki_threads / f"{topic_l}.md"
+            if thread_path.exists():
+                from deep_reader.thread_utils import extract_section
+                evidence = extract_section(thread_path.read_text(), "Evidence")
+                import re as _re
+                for m in _re.finditer(r"\[\[([^\]/]+)/chunk-\d+\]\]", evidence):
+                    contributing.add(m.group(1))
+        else:
+            # Treat as concept — find sources tagging this concept
+            import re as _re
+            for src_slug in state.sources:
+                src_dir = config.wiki_sources / src_slug
+                for cp in src_dir.glob("chunk-*.md"):
+                    page = cp.read_text()
+                    if _re.search(r"\[\[" + _re.escape(topic_l) + r"\]\]", page, _re.IGNORECASE):
+                        contributing.add(src_slug)
+                        break
+        if not contributing:
+            return []
+        # Rank people by overlap
+        ranked = []
+        for p in state.people.values():
+            overlap = len(set(p.appearances) & contributing)
+            if overlap:
+                ranked.append({
+                    "slug": p.slug, "name": p.name, "role": p.role,
+                    "appearances_overlap": overlap,
+                    "total_appearances": len(p.appearances),
+                })
+        ranked.sort(key=lambda x: x["appearances_overlap"], reverse=True)
+        return ranked[:limit]
+
+    @mcp.tool()
+    def overlap(slug_a: str, slug_b: str) -> dict:
+        """Shared sources / threads / concepts between two entities.
+
+        Useful for 'what do Jane and Bob have in common' or 'what
+        threads do these two people both appear in'.
+        """
+        state = GlobalState.load(config.state_file)
+        sources_a = _entity_sources(state, slug_a, config)
+        sources_b = _entity_sources(state, slug_b, config)
+        if not sources_a or not sources_b:
+            return {"error": "one or both slugs not found"}
+        shared_sources = sorted(sources_a & sources_b)
+        return {
+            "a": slug_a,
+            "b": slug_b,
+            "shared_sources": shared_sources,
+            "shared_count": len(shared_sources),
+            "a_only_count": len(sources_a - sources_b),
+            "b_only_count": len(sources_b - sources_a),
+        }
+
+    @mcp.tool()
+    def timeline(
+        person: str | None = None,
+        thread: str | None = None,
+        concept: str | None = None,
+        since_days: int = 90,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Chronological event stream from the vault.
+
+        Filters: by person (sources where they appear), by thread (sources
+        in evidence), by concept (sources tagging it), by date window
+        (since_days, default 90).
+        """
+        from datetime import timedelta
+        state = GlobalState.load(config.state_file)
+        cutoff = datetime.now() - timedelta(days=since_days)
+        # Build candidate source set based on filters
+        candidates: set[str] = set(state.sources.keys())
+        if person:
+            person_slug = person if person in state.people else None
+            if not person_slug:
+                for p in state.people.values():
+                    if p.name.lower() == person.lower():
+                        person_slug = p.slug
+                        break
+            if person_slug:
+                candidates &= set(state.people[person_slug].appearances)
+            else:
+                return []
+        if thread:
+            thread_path = config.wiki_threads / f"{thread}.md"
+            if thread_path.exists():
+                from deep_reader.thread_utils import extract_section
+                import re as _re
+                evidence = extract_section(thread_path.read_text(), "Evidence")
+                thread_sources = {m.group(1) for m in _re.finditer(r"\[\[([^\]/]+)/chunk-\d+\]\]", evidence)}
+                candidates &= thread_sources
+        if concept:
+            concept_l = concept.lower()
+            import re as _re
+            concept_sources: set[str] = set()
+            for src_slug in candidates:
+                src_dir = config.wiki_sources / src_slug
+                for cp in src_dir.glob("chunk-*.md"):
+                    if _re.search(r"\[\[" + _re.escape(concept_l) + r"\]\]", cp.read_text(), _re.IGNORECASE):
+                        concept_sources.add(src_slug)
+                        break
+            candidates &= concept_sources
+
+        events = []
+        for slug in candidates:
+            src = state.sources[slug]
+            if src.completed_at and src.completed_at >= cutoff:
+                events.append({
+                    "kind": "source_ingested",
+                    "when": src.completed_at.isoformat(),
+                    "slug": slug,
+                    "type": src.source_type,
+                })
+        # Action items in window
+        for a in state.action_items:
+            if a.created_at >= cutoff:
+                if person and a.owner != (state.people.get(person, None) and state.people[person].slug):
+                    continue
+                events.append({
+                    "kind": "action_item_created",
+                    "when": a.created_at.isoformat(),
+                    "id": a.id, "owner": a.owner, "category": a.category,
+                    "description": a.description[:80],
+                })
+            if a.completed_at and a.completed_at >= cutoff:
+                events.append({
+                    "kind": "action_item_closed",
+                    "when": a.completed_at.isoformat(),
+                    "id": a.id, "description": a.description[:80],
+                })
+        events.sort(key=lambda e: e["when"], reverse=True)
+        return events[:limit]
+
+    @mcp.tool()
+    def coverage(slug: str) -> dict:
+        """All sources, people, time range contributing to a thread or concept.
+
+        Pure metadata — no content. Use to understand the SCOPE of an
+        entity before deciding to read source content.
+        """
+        state = GlobalState.load(config.state_file)
+        contributing_sources: list[str] = []
+        contributing_people: list[str] = []
+        # Resolve as thread first
+        thread_path = config.wiki_threads / f"{slug}.md"
+        if thread_path.exists():
+            from deep_reader.thread_utils import extract_section
+            import re as _re
+            evidence = extract_section(thread_path.read_text(), "Evidence")
+            seen: set[str] = set()
+            for m in _re.finditer(r"\[\[([^\]/]+)/chunk-\d+\]\]", evidence):
+                if m.group(1) not in seen:
+                    seen.add(m.group(1))
+                    contributing_sources.append(m.group(1))
+        elif slug in state.concepts or slug.lower() in state.concepts:
+            slug_l = slug.lower() if slug.lower() in state.concepts else slug
+            import re as _re
+            for src_slug in state.sources:
+                src_dir = config.wiki_sources / src_slug
+                for cp in src_dir.glob("chunk-*.md"):
+                    if _re.search(r"\[\[" + _re.escape(slug_l) + r"\]\]", cp.read_text(), _re.IGNORECASE):
+                        contributing_sources.append(src_slug)
+                        break
+            slug = slug_l
+        else:
+            return {"error": f"'{slug}' not found as thread or concept"}
+
+        # People involved
+        for p in state.people.values():
+            if set(p.appearances) & set(contributing_sources):
+                contributing_people.append(p.slug)
+
+        # Time range
+        dates = []
+        for s in contributing_sources:
+            src = state.sources.get(s)
+            if src and src.completed_at:
+                dates.append(src.completed_at)
+        first = min(dates).date().isoformat() if dates else None
+        last = max(dates).date().isoformat() if dates else None
+
+        return {
+            "slug": slug,
+            "source_count": len(contributing_sources),
+            "sources": contributing_sources,
+            "person_count": len(contributing_people),
+            "people": contributing_people,
+            "first_appearance": first,
+            "last_appearance": last,
+        }
+
+    @mcp.tool()
+    def recent_activity(slug: str, since_days: int = 30) -> dict:
+        """What's happened around an entity recently.
+
+        Returns recent sources mentioning the entity, recent action items
+        attributed to it, and any thread evidence added in the window.
+        """
+        return timeline(  # type: ignore[name-defined]
+            person=slug if slug in GlobalState.load(config.state_file).people else None,
+            thread=slug,
+            concept=slug,
+            since_days=since_days,
+            limit=30,
+        )
+
+    @mcp.tool()
+    def connections_between(slug_a: str, slug_b: str) -> dict:
+        """Find the path / shared context linking two entities.
+
+        E.g., 'how is Jane connected to the Duckbill thread' → returns
+        the sources where Jane appears AND that contribute to duckbill,
+        the people they share, the threads/concepts they both touch.
+        """
+        state = GlobalState.load(config.state_file)
+        sources_a = _entity_sources(state, slug_a, config)
+        sources_b = _entity_sources(state, slug_b, config)
+        shared_sources = sorted(sources_a & sources_b)
+        # People who appear in any shared source
+        shared_people: set[str] = set()
+        for s in shared_sources:
+            for p in state.people.values():
+                if s in p.appearances:
+                    shared_people.add(p.slug)
+        return {
+            "a": slug_a,
+            "b": slug_b,
+            "shared_sources": shared_sources,
+            "shared_people": sorted(shared_people),
+            "connection_strength": len(shared_sources),
+        }
+
+    # ---------- Concept hierarchy tools ----------
+
+    @mcp.tool()
+    def link_concepts(parent: str, child: str, kind: str = "parent") -> dict:
+        """Establish a relationship between two concepts.
+
+        kind: 'parent' (child is-a parent) or 'related' (peer relationship).
+        Both concepts will be created in state if they don't exist.
+        """
+        state = GlobalState.load(config.state_file)
+        result = _do_link_concepts(config, state, parent=parent, child=child, kind=kind)
+        return result
+
+    @mcp.tool()
+    def unlink_concepts(slug_a: str, slug_b: str) -> dict:
+        """Remove all relationships between two concepts."""
+        state = GlobalState.load(config.state_file)
+        a_slug = slug_a.strip().lower().replace(" ", "-")
+        b_slug = slug_b.strip().lower().replace(" ", "-")
+        for slug in (a_slug, b_slug):
+            if slug not in state.concepts:
+                continue
+            c = state.concepts[slug]
+            other = b_slug if slug == a_slug else a_slug
+            c.parent_concepts = [s for s in c.parent_concepts if s != other]
+            c.child_concepts = [s for s in c.child_concepts if s != other]
+            c.related_concepts = [s for s in c.related_concepts if s != other]
+        state.save(config.state_file)
+        return {"unlinked": [a_slug, b_slug]}
+
+    @mcp.tool()
+    def get_concept_with_hierarchy(name: str, depth: int = 2) -> dict:
+        """Return a concept + its parent chain (recursive) + children + related.
+
+        depth controls how many levels of parent/child to walk (default 2).
+        Useful when you're discussing a child concept and want to bring in
+        its parents' contextual content.
+        """
+        state = GlobalState.load(config.state_file)
+        slug = name.strip().lower().replace(" ", "-")
+        if slug not in state.concepts:
+            return {"error": f"concept '{name}' not found"}
+
+        # Walk parent chain up to `depth`
+        parent_chain: list[str] = []
+        seen: set[str] = set()
+        frontier = [slug]
+        for _level in range(depth):
+            next_frontier = []
+            for s in frontier:
+                if s not in state.concepts:
+                    continue
+                for p in state.concepts[s].parent_concepts:
+                    if p not in seen and p != slug:
+                        seen.add(p)
+                        parent_chain.append(p)
+                        next_frontier.append(p)
+            frontier = next_frontier
+            if not frontier:
+                break
+
+        c = state.concepts[slug]
+        return {
+            "slug": slug,
+            "name": c.name,
+            "parents": parent_chain,
+            "children": list(c.child_concepts),
+            "related": list(c.related_concepts),
+            "sources_at_last_refresh": c.sources_at_last_refresh,
+            "last_refreshed": c.last_refreshed.isoformat() if c.last_refreshed else None,
+            "page_exists": (config.wiki_concepts / f"{slug}.md").exists(),
+        }
+
+    @mcp.tool()
+    def list_stale_concepts(min_new_sources: int = 3) -> list[dict]:
+        """Concepts whose page is out of date relative to current source coverage.
+
+        Returns concepts where (current source-tag count) - (sources at last
+        refresh) >= threshold, OR concepts with no page yet that have >= 3
+        source tags.
+        """
+        state = GlobalState.load(config.state_file)
+        # Compute current source-tag count per concept
+        from collections import defaultdict
+        import re as _re
+        coverage_now: dict[str, set[str]] = defaultdict(set)
+        for src_slug in state.sources:
+            src_dir = config.wiki_sources / src_slug
+            for cp in src_dir.glob("chunk-*.md"):
+                page = cp.read_text()
+                in_concepts = False
+                buf = []
+                for line in page.split("\n"):
+                    if line.startswith("## Concepts"):
+                        in_concepts = True
+                        continue
+                    if in_concepts and line.startswith("## "):
+                        break
+                    if in_concepts:
+                        buf.append(line)
+                section = "\n".join(buf)
+                for m in _re.finditer(r"\[\[([^\]]+)\]\]", section):
+                    coverage_now[m.group(1).strip().lower()].add(src_slug)
+
+        stale: list[dict] = []
+        for name, sources in coverage_now.items():
+            current_count = len(sources)
+            concept = state.concepts.get(name)
+            page_exists = (config.wiki_concepts / f"{name}.md").exists()
+
+            if not page_exists and current_count >= 3:
+                stale.append({
+                    "name": name,
+                    "reason": "no_page_yet",
+                    "current_sources": current_count,
+                    "sources_at_last_refresh": 0,
+                })
+                continue
+            if concept and (current_count - concept.sources_at_last_refresh) >= min_new_sources:
+                stale.append({
+                    "name": name,
+                    "reason": "new_sources_since_refresh",
+                    "current_sources": current_count,
+                    "sources_at_last_refresh": concept.sources_at_last_refresh,
+                    "delta": current_count - concept.sources_at_last_refresh,
+                })
+        stale.sort(key=lambda x: x.get("delta", x["current_sources"]), reverse=True)
+        return stale
+
+    @mcp.tool()
+    def record_concept_page(
+        name: str,
+        definition: str,
+        distillation: str,
+        contributing_sources: list[str],
+        parent_concepts: list[str] | None = None,
+        child_concepts: list[str] | None = None,
+        related_concepts: list[str] | None = None,
+        tensions: str = "",
+    ) -> dict:
+        """Write or replace a concept page at /wiki/concepts/{slug}.md.
+
+        Concept pages are the ONE place persistent prose synthesis is
+        appropriate — concepts are meta-entities that exist as integrations
+        across sources. Constraints:
+          - definition: 1-paragraph definition in this vault's working context
+          - distillation: 2-3 paragraph integrated reflection. Heavy citations
+            via [[<source-slug>]]. Direct quotes where they sharpen the
+            picture. Not a paraphrase that replaces source material.
+          - contributing_sources: every source slug tagging this concept
+          - hierarchy fields: optional, link concepts via link_concepts too
+
+        For initial creation OR refresh; both go through this tool. The
+        existing page (if any) is replaced — but typically called via the
+        review queue (`propose_review` with kind='concept_refresh') so the
+        user sees a diff first.
+        """
+        state = GlobalState.load(config.state_file)
+        return _do_record_concept_page(
+            config, state,
+            name=name, definition=definition, distillation=distillation,
+            contributing_sources=contributing_sources,
+            parent_concepts=parent_concepts or [],
+            child_concepts=child_concepts or [],
+            related_concepts=related_concepts or [],
+            tensions=tensions,
+        )
+
+    # ---------- Drive tracking ----------
+
+    @mcp.tool()
+    def is_drive_ingested(drive_id: str) -> dict:
+        """Check if a Drive doc has already been ingested.
+
+        Returns the source slug if yes, null if no. Use during /crawl_drive
+        to skip docs already in the vault.
+        """
+        state = GlobalState.load(config.state_file)
+        return {
+            "drive_id": drive_id,
+            "ingested": drive_id in state.drive.ingested_ids,
+            "source_slug": state.drive.ingested_ids.get(drive_id),
+        }
+
+    @mcp.tool()
+    def mark_drive_ingested(drive_id: str, source_slug: str) -> dict:
+        """Record that a Drive doc has been ingested as a given source.
+
+        Call this after record_doc completes for a Drive-sourced document.
+        """
+        state = GlobalState.load(config.state_file)
+        state.drive.ingested_ids[drive_id] = source_slug
+        state.drive.last_crawl_at = datetime.now()
+        state.save(config.state_file)
+        return {"drive_id": drive_id, "source_slug": source_slug, "tracked": True}
+
+    @mcp.tool()
+    def list_drive_ingested() -> dict:
+        """All Drive doc IDs currently tracked as ingested."""
+        state = GlobalState.load(config.state_file)
+        return {
+            "count": len(state.drive.ingested_ids),
+            "last_crawl_at": state.drive.last_crawl_at.isoformat() if state.drive.last_crawl_at else None,
+            "ids": dict(state.drive.ingested_ids),
+        }
+
+    # ---------- Review queue ----------
+    #
+    # Some Claude-proposed actions need user approval before being made
+    # final — concept page replacements, hierarchy suggestions, Drive
+    # ingest candidates, borderline-relevance docs. Those go into a
+    # persistent review queue rendered to /wiki/_review/pending.md and
+    # surfaced via the vault summary.
+
+    @mcp.tool()
+    def list_pending_reviews(kind: str | None = None) -> list[dict]:
+        """List items waiting for user approval. Optionally filter by kind."""
+        state = GlobalState.load(config.state_file)
+        items = [r for r in state.review_queue if r.status == "pending"]
+        if kind:
+            items = [r for r in items if r.kind == kind]
+        items.sort(key=lambda r: r.created_at, reverse=True)
+        return [_dump_review(r) for r in items]
+
+    @mcp.tool()
+    def get_review(id: str) -> dict:
+        """Get full details of a single review item, including its proposed action."""
+        state = GlobalState.load(config.state_file)
+        for r in state.review_queue:
+            if r.id == id:
+                return _dump_review(r, full=True)
+        return {"error": f"no review with id '{id}'"}
+
+    @mcp.tool()
+    def propose_review(
+        kind: str,
+        title: str,
+        preview: str,
+        proposed_action: dict,
+    ) -> dict:
+        """Queue an action for user approval.
+
+        kind: one of `concept_refresh`, `concept_link`, `enrichment_ingest`,
+              `drive_borderline`, or any other label Claude finds useful.
+        title: a short one-line summary the user will scan.
+        preview: a longer multi-line description / diff so the user can
+              decide informed.
+        proposed_action: {tool: str, args: dict} — what gets executed on
+              approve. Must reference an existing tool name.
+
+        Returns the assigned ID so Claude can mention it back to the user.
+        """
+        import hashlib as _hash
+        state = GlobalState.load(config.state_file)
+        rid = _hash.sha1(
+            f"{kind}|{title}|{datetime.now().isoformat()}".encode()
+        ).hexdigest()[:10]
+        item = state.review_queue.__class__.__args__[0] if False else None
+        # Direct construct since the type isn't easily importable from here
+        from deep_reader.state import ReviewItem
+        item = ReviewItem(
+            id=rid,
+            kind=kind,
+            title=title,
+            preview=preview,
+            proposed_action=proposed_action,
+            created_at=datetime.now(),
+        )
+        state.review_queue.append(item)
+        state.save(config.state_file)
+        _render_review_pending(config, state)
+        return {"id": rid, "queued": True}
+
+    @mcp.tool()
+    def approve_review(id: str) -> dict:
+        """Approve a queued action — executes the proposed_action and marks done.
+
+        Dispatches to the named tool with the stored args. Returns the
+        result of the executed tool, or an error if the tool isn't
+        recognized / doesn't exist.
+        """
+        state = GlobalState.load(config.state_file)
+        item = next((r for r in state.review_queue if r.id == id), None)
+        if not item:
+            return {"error": f"no review with id '{id}'"}
+        if item.status != "pending":
+            return {"error": f"review {id} already {item.status}"}
+
+        # Execute the proposed action by dispatching to the named tool.
+        action = item.proposed_action or {}
+        tool_name = action.get("tool")
+        tool_args = action.get("args", {})
+        result = _dispatch_review_action(config, tool_name, tool_args)
+
+        # Mark the item resolved
+        item.status = "approved"
+        item.reviewed_at = datetime.now()
+        state.save(config.state_file)
+        _render_review_pending(config, state)
+        return {"id": id, "status": "approved", "execution_result": result}
+
+    @mcp.tool()
+    def reject_review(id: str, reason: str = "") -> dict:
+        """Reject a queued action without executing it."""
+        state = GlobalState.load(config.state_file)
+        item = next((r for r in state.review_queue if r.id == id), None)
+        if not item:
+            return {"error": f"no review with id '{id}'"}
+        if item.status != "pending":
+            return {"error": f"review {id} already {item.status}"}
+        item.status = "rejected"
+        item.reviewed_at = datetime.now()
+        state.save(config.state_file)
+        _render_review_pending(config, state)
+        return {"id": id, "status": "rejected", "reason": reason}
 
     @mcp.tool()
     def search(
@@ -500,25 +1111,6 @@ def build_server(vault_root: Path):
         }
 
     @mcp.tool()
-    def update_thread_thesis(slug: str, new_thesis: str) -> dict:
-        """Replace the Thesis section of a thread file. Preserves Evidence + Status.
-
-        Used after /refresh_thread_synthesis: Claude reads the thread + its
-        evidence sources via get_thread_full_context, writes a richer
-        thesis (typically 3-5 paragraphs synthesizing how the topic has
-        developed), then calls this tool to persist.
-        """
-        from deep_reader.thread_utils import extract_section, assemble_thread
-        path = config.wiki_threads / f"{slug}.md"
-        if not path.exists():
-            return {"error": f"thread '{slug}' not found"}
-        existing = path.read_text()
-        evidence = extract_section(existing, "Evidence")
-        status = extract_section(existing, "Status")
-        path.write_text(assemble_thread(new_thesis.strip(), evidence, status))
-        return {"slug": slug, "thesis_chars": len(new_thesis.strip())}
-
-    @mcp.tool()
     def get_person_full_context(slug: str, max_sources: int = 30) -> dict:
         """Return a person + the content of every source they appear in.
 
@@ -574,56 +1166,6 @@ def build_server(vault_root: Path):
             "sources": sources,
             "open_waiting_on_them": open_waiting,
         }
-
-    @mcp.tool()
-    def update_person_summary(slug: str, new_summary: str) -> dict:
-        """Replace the Summary section of a person page + reset the staleness counter.
-
-        Used after /refresh_person_summary: Claude reads the person via
-        get_person_full_context, writes a 2-4 paragraph synthesis of who
-        this person is to the vault owner (role, dynamics, recurring
-        themes, current state of the relationship), then calls this to
-        persist.
-        """
-        from deep_reader.steps import people as people_step
-        state = GlobalState.load(config.state_file)
-        if slug not in state.people:
-            return {"error": f"person '{slug}' not found"}
-        person = state.people[slug]
-        person.summary = new_summary.strip()
-        person.new_appearances_since_summary = 0
-        state.save(config.state_file)
-        people_step.render_person_page(person, state, config.wiki_people)
-        return {"slug": slug, "summary_chars": len(new_summary.strip())}
-
-    @mcp.tool()
-    def list_stale_person_summaries(min_new_appearances: int = 3) -> list[dict]:
-        """List people whose summaries are stale and worth regenerating.
-
-        A summary is stale if `new_appearances_since_summary` >= threshold
-        (default 3) OR if the person has no summary yet but has at least
-        one appearance.
-        """
-        state = GlobalState.load(config.state_file)
-        stale = []
-        for p in state.people.values():
-            no_summary = not (p.summary or "").strip()
-            if no_summary and p.appearances:
-                stale.append(p)
-                continue
-            if p.new_appearances_since_summary >= min_new_appearances:
-                stale.append(p)
-        stale.sort(key=lambda p: p.new_appearances_since_summary, reverse=True)
-        return [
-            {
-                "slug": p.slug,
-                "name": p.name,
-                "appearances": len(p.appearances),
-                "new_since_summary": p.new_appearances_since_summary,
-                "has_summary": bool((p.summary or "").strip()),
-            }
-            for p in stale
-        ]
 
     @mcp.tool()
     def list_concept_candidates(min_sources: int = 3) -> list[dict]:
@@ -717,119 +1259,6 @@ def build_server(vault_root: Path):
             "sources": matching_sources,
             "existing_article": existing_article,
         }
-
-    @mcp.tool()
-    def record_concept_article(name: str, content: str) -> dict:
-        """Write or replace a concept synthesis article at /wiki/concepts/{name}.md.
-
-        Used after /compile_concepts: Claude reads concept evidence via
-        get_concept_evidence, writes a synthesis article (definition,
-        how different sources approach it, agreements/tensions, open
-        questions), then calls this to persist.
-        """
-        from deep_reader.markdown import format_frontmatter
-        slug = name.strip().lower().replace(" ", "-")
-        path = config.wiki_concepts / f"{slug}.md"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fm = {"name": name, "type": "concept"}
-        path.write_text(format_frontmatter(fm) + content.strip() + "\n")
-        return {"name": name, "slug": slug, "chars": len(content)}
-
-    @mcp.tool()
-    def get_digest_context(period: str, period_str: str) -> dict:
-        """Return everything that happened in a time window for digest writing.
-
-        period: "week" | "month" | "quarter"
-        period_str: e.g. "2026-W17", "2026-04", "2026-Q2"
-
-        Returns: sources completed in window, action items created in
-        window, threads with new evidence in window, top people by
-        appearance count in window.
-        """
-        from datetime import datetime as _dt, timedelta
-        state = GlobalState.load(config.state_file)
-
-        # Parse period_str into a window
-        try:
-            if period == "week":
-                # ISO week: "YYYY-Www"
-                year, wk = period_str.split("-W")
-                start = _dt.strptime(f"{year}-W{wk}-1", "%G-W%V-%u")
-                end = start + timedelta(days=7)
-            elif period == "month":
-                # "YYYY-MM"
-                y, m = period_str.split("-")
-                start = _dt(int(y), int(m), 1)
-                if int(m) == 12:
-                    end = _dt(int(y) + 1, 1, 1)
-                else:
-                    end = _dt(int(y), int(m) + 1, 1)
-            elif period == "quarter":
-                # "YYYY-QN"
-                y, q = period_str.split("-Q")
-                start_month = (int(q) - 1) * 3 + 1
-                start = _dt(int(y), start_month, 1)
-                end_month = start_month + 3
-                if end_month > 12:
-                    end = _dt(int(y) + 1, 1, 1)
-                else:
-                    end = _dt(int(y), end_month, 1)
-            else:
-                return {"error": f"unknown period '{period}' (use week/month/quarter)"}
-        except (ValueError, IndexError) as e:
-            return {"error": f"could not parse period_str '{period_str}': {e}"}
-
-        # Sources completed in window
-        sources_in_window = []
-        for slug, src in state.sources.items():
-            if src.completed_at and start <= src.completed_at < end:
-                sources_in_window.append({
-                    "slug": slug,
-                    "completed": src.completed_at.isoformat(),
-                    "type": src.source_type,
-                })
-
-        # Action items created in window
-        actions_in_window = [
-            _dump_action(a, state)
-            for a in state.action_items
-            if start <= a.created_at < end
-        ]
-
-        # Top people by appearance frequency in this window's sources
-        from collections import Counter
-        appearance_counter: Counter = Counter()
-        window_slugs = {s["slug"] for s in sources_in_window}
-        for p in state.people.values():
-            count = sum(1 for app in p.appearances if app in window_slugs)
-            if count:
-                appearance_counter[p.slug] = count
-        top_people = [
-            {"slug": slug, "name": state.people[slug].name, "appearances_this_period": cnt}
-            for slug, cnt in appearance_counter.most_common(15)
-        ]
-
-        return {
-            "period": period,
-            "period_str": period_str,
-            "window_start": start.isoformat(),
-            "window_end": end.isoformat(),
-            "sources": sources_in_window,
-            "action_items_created": actions_in_window,
-            "top_people": top_people,
-            "thread_names": state.global_threads,
-        }
-
-    @mcp.tool()
-    def record_digest(period: str, period_str: str, content: str) -> dict:
-        """Write a digest summary at /wiki/digests/{period}/{period_str}.md."""
-        from deep_reader.markdown import format_frontmatter
-        digests_dir = config.vault_root / "wiki" / "digests" / period
-        digests_dir.mkdir(parents=True, exist_ok=True)
-        path = digests_dir / f"{period_str}.md"
-        fm = {"period": period, "period_str": period_str, "type": "digest"}
-        path.write_text(format_frontmatter(fm) + content.strip() + "\n")
-        return {"path": str(path.relative_to(config.vault_root)), "chars": len(content)}
 
     @mcp.tool()
     def link_action_item(id: str, source_ref: str) -> dict:
@@ -1641,244 +2070,282 @@ present in the source, omit or pass [] for anything that isn't):
             "fields minus attendees/decisions/date.\n"
         )
 
-    # ---------- Synthesis-refresh prompts ----------
+    # ---------- Concept distillation prompts (the synthesis exception) ----------
     #
-    # These drive Claude through the "write a richer synthesis from
-    # accumulated evidence" pattern. They become more valuable as the
-    # vault grows past ~50 sources — when raw retrieval starts missing
-    # the cross-cutting story and synthesis articles become the right
-    # first stop for queries.
+    # Concept pages are the ONE place we synthesize. They're meta-entities
+    # that exist as integrations across sources. All operations go through
+    # the review queue so the user approves before pages are written.
 
     @mcp.prompt(
         description=(
-            "Refresh a single thread's thesis — read its evidence, write "
-            "a richer multi-paragraph synthesis of how the topic has "
-            "developed across all the sources that touched it."
+            "Refresh a concept page — re-reads the sources tagging this "
+            "concept and proposes an updated definition + distillation. "
+            "Goes to the review queue so you can diff before it's written."
         ),
     )
-    def refresh_thread_synthesis(slug: str) -> str:
+    def refresh_concept(name: str) -> str:
         return (
-            f"Regenerate the thesis for thread '{slug}' from its full "
-            f"evidence log. Steps:\n"
+            f"Refresh the concept page for '{name}'. The result goes to "
+            f"the review queue for approval — does NOT immediately write "
+            f"the page.\n"
             "\n"
-            f"1. Call `get_thread_full_context(slug='{slug}')`. You'll "
-            "get the current thesis, the evidence log, and the full "
-            "content of every source page referenced in the evidence.\n"
-            "2. Read the evidence sources chronologically (they're "
-            "already in order). Trace how the topic has developed: "
-            "what was first established, what changed, what surprised, "
-            "what's still open.\n"
-            "3. Write a synthesis (3-5 paragraphs, ~300-500 words):\n"
-            "   - Lead with the current state in one tight paragraph.\n"
-            "   - A paragraph on how it got here — key inflection points "
-            "from the evidence, in chronological order.\n"
-            "   - A paragraph on tensions or open questions still active.\n"
-            "   - Optional: implications or what this connects to.\n"
-            "4. Call `update_thread_thesis(slug='" + slug + "', "
-            "new_thesis=<your text>)` to persist. Don't include "
-            "headers like '## Thesis' — just the body.\n"
-            "5. Confirm: report a one-line summary of what changed in "
-            "the thesis vs. before.\n"
+            f"1. `get_concept_evidence(name='{name}')` — every source tagging "
+            f"this concept, with full content. Also returns existing_article "
+            f"if there's already a page.\n"
+            f"2. `get_concept_with_hierarchy(name='{name}')` — current "
+            f"parent/child/related concepts.\n"
+            f"3. Read every source's content. Identify how the concept is "
+            f"used / understood across sources. Note tensions if sources "
+            f"disagree.\n"
+            f"4. Write a structured concept page with sections:\n"
+            f"   - **Definition** (1 paragraph): how the concept is used in "
+            f"this vault's context. NOT a generic dictionary def.\n"
+            f"   - **Distillation** (2-3 paragraphs): integrated "
+            f"understanding. Heavy citation via `[[<source-slug>]]`. Use "
+            f"direct markdown blockquotes where source language matters. "
+            f"This is the place where it's OK to synthesize across sources, "
+            f"BUT every claim must be traceable.\n"
+            f"   - **Tensions / open questions** (optional): where sources "
+            f"disagree or the concept is still evolving, with citations.\n"
+            f"5. Call `propose_review(\n"
+            f"      kind='concept_refresh',\n"
+            f"      title='Refresh concept page: {name}',\n"
+            f"      preview=<diff-style summary: what's changing vs existing page (if any)>,\n"
+            f"      proposed_action={{\n"
+            f"          'tool': 'record_concept_page',\n"
+            f"          'args': {{name, definition, distillation, "
+            f"contributing_sources, parent_concepts, child_concepts, "
+            f"related_concepts, tensions}}\n"
+            f"      }}\n"
+            f"   )`.\n"
+            f"6. Tell me the review id and the title — say *'review {{id}} "
+            f"is queued. Approve in chat with: approve {{id}}'*.\n"
             "\n"
-            "Bias: paragraphs over bullet lists. The thesis should read "
-            "like an analyst's brief, not a search result. Quote or "
-            "paraphrase specific evidence; don't make claims the sources "
-            "don't support."
+            "Hard rule: if you can't write the distillation without "
+            "paraphrasing every source into abstract prose, say the "
+            "evidence is too thin and skip — don't queue a review."
         )
 
     @mcp.prompt(
         description=(
-            "Refresh ALL thread theses — walks every thread with at "
-            "least 3 evidence entries and regenerates its synthesis. "
-            "Run periodically (weekly is fine)."
+            "Survey vault for stale concept pages and propose refreshes. "
+            "Each refresh goes to the review queue."
         ),
     )
-    def refresh_all_thread_syntheses(min_evidence: int = 3) -> str:
+    def list_stale() -> str:
         return (
-            "Bulk-refresh every thread thesis. Steps:\n"
+            "Survey the vault for stale concept pages and propose refreshes:\n"
             "\n"
-            "1. Use `vault://summary` and existing tools to enumerate "
-            "the active threads. (Or call `search(query='', depth='lite', "
-            "limit=50)` and inspect the threads list — but better, just "
-            "ask me which threads to refresh if there are many.)\n"
-            "2. For each thread:\n"
-            "   a. Call `get_thread_full_context(slug=...)`.\n"
-            "   b. Skip if `evidence_source_count` < "
-            f"{min_evidence} — too thin to synthesize meaningfully.\n"
-            "   c. Otherwise, write a 3-5 paragraph synthesis and call "
-            "`update_thread_thesis(...)` to persist.\n"
-            "3. Report at the end: how many were refreshed, how many "
-            "skipped as too thin.\n"
-            "\n"
-            "Take your time per thread — this is meant to be a quality "
-            "pass, not a speed run. If 10+ threads need refresh, do "
-            "them in two batches and ask me which to prioritize."
+            "1. `list_stale_concepts(min_new_sources=3)`.\n"
+            "2. For each (or batch — ask if many): run the refresh_concept "
+            "flow and queue a review item. Don't actually write anything; "
+            "the user approves via the queue.\n"
+            "3. Report the list of queued reviews with IDs."
         )
 
     @mcp.prompt(
         description=(
-            "Refresh a single person's summary — read their full "
-            "interaction history and write a synthesis of who they are "
-            "in the vault."
+            "Survey ingested sources, propose concept hierarchy "
+            "relationships (parent/child/related). Goes to review queue."
         ),
     )
-    def refresh_person_summary(name: str) -> str:
+    def suggest_concept_links() -> str:
         return (
-            f"Regenerate the summary for {name}. Steps:\n"
+            "Survey the vault for concept hierarchy you might be missing.\n"
             "\n"
-            f"1. Call `get_person_full_context(slug='{name}')` — pass "
-            "either the slug or the full name; the tool will resolve.\n"
-            "2. Read every source where this person appears. Look for: "
-            "their role, recurring themes when they show up, the dynamic "
-            "between them and the vault owner, what's open with them.\n"
-            "3. Write a 2-4 paragraph summary:\n"
-            "   - Who they are (role, organization, relationship).\n"
-            "   - Recurring themes / patterns across appearances.\n"
-            "   - Current state — what's open, what's been resolved, "
-            "what they're working on.\n"
-            "   - Optional: stylistic / personality notes if visible "
-            "from sources (e.g., 'tends to push back hard on price', "
-            "'asks for written followups').\n"
-            "4. Call `update_person_summary(slug=<slug from step 1>, "
-            "new_summary=<your text>)`. Don't include the '## Summary' "
-            "header — just the body.\n"
-            "5. Confirm: report what's now in the summary.\n"
+            "1. `list_concept_candidates(min_sources=2)` — get every "
+            "concept currently in the vault.\n"
+            "2. For each pair of concepts, look at the sources that tag "
+            "them. If sources strongly suggest 'A is a kind of B' or 'A "
+            "and B are aspects of the same thing', propose a relationship.\n"
+            "3. For each proposal, call `propose_review(\n"
+            "     kind='concept_link',\n"
+            "     title='Link: <child> → <parent>',\n"
+            "     preview=<one-paragraph rationale citing the sources that "
+            "suggested it>,\n"
+            "     proposed_action={'tool': 'link_concepts', 'args': "
+            "{parent, child, kind}}\n"
+            "   )`.\n"
+            "4. Report all queued reviews to me with their IDs.\n"
             "\n"
-            "Bias toward grounded specifics over generic descriptions. "
-            "Reference particular sources or quotes if they illustrate "
-            "a pattern."
+            "Conservative bias: don't propose if you wouldn't be confident "
+            "saying it out loud. False positives are noise."
+        )
+
+    # ---------- Drive integration prompts ----------
+
+    @mcp.prompt(
+        description=(
+            "One-time backfill from Google Drive — walks every doc in a "
+            "folder, ingests substantive content. Heavy operation; run "
+            "per-folder. Requires Drive MCP server registered alongside."
+        ),
+    )
+    def backfill_drive(folder_path: str = "") -> str:
+        target = folder_path or "(ask me which folder to start with)"
+        return (
+            f"Backfill Drive content from {target}:\n"
+            "\n"
+            "1. Use the Drive MCP to list every doc in the target folder "
+            "(recursive). Filter to recognizable content types: Google "
+            "Docs, PDFs, Slides, .docx files. Skip Sheets unless they're "
+            "structured docs, skip forms / junk.\n"
+            "2. Call `list_drive_ingested()` to get already-ingested doc "
+            "IDs. Skip those.\n"
+            "3. Call `get_ingest_context()` once for owner identity, "
+            "active threads, known people.\n"
+            "4. For each remaining doc:\n"
+            "   a. Read full content via the Drive MCP (don't rely on "
+            "metadata alone — actual content determines whether it's "
+            "substantive).\n"
+            "   b. If the doc is genuinely junk (auto-generated forms, "
+            "expired drafts, random notes with no structure), skip and "
+            "report why.\n"
+            "   c. Otherwise: analyze and call `record_doc(...)` with "
+            "the structured payload.\n"
+            "   d. After successful record_doc, call "
+            "`mark_drive_ingested(drive_id, source_slug)` to track it.\n"
+            "5. Report: total docs found, ingested, skipped (with "
+            "reasons), failed (with errors).\n"
+            "\n"
+            "This is heavy — could be 50–500 docs per folder. Do them "
+            "in batches, ask before continuing if the folder is huge. "
+            "If a doc's relevance is borderline, instead of skipping or "
+            "ingesting, call `propose_review(kind='drive_borderline', "
+            "title='Borderline: <doc title>', preview=<one-paragraph "
+            "summary + rationale>, proposed_action={'tool': "
+            "'ingest_drive_doc', 'args': {drive_id, content, ...}})` and "
+            "let me decide later."
         )
 
     @mcp.prompt(
         description=(
-            "Refresh stale person summaries — finds people with 3+ new "
-            "appearances since their last summary and regenerates each."
+            "Incremental Drive crawl — process docs modified since last "
+            "crawl. Cheaper than backfill; run weekly or on demand."
         ),
     )
-    def refresh_stale_person_summaries(min_new_appearances: int = 3) -> str:
+    def crawl_drive(since: str = "") -> str:
         return (
-            f"Bulk-refresh stale person summaries. Steps:\n"
+            f"Incremental Drive crawl. Only docs modified since "
+            f"{since or 'last crawl'}.\n"
             "\n"
-            f"1. Call `list_stale_person_summaries(min_new_appearances="
-            f"{min_new_appearances})` to get the list.\n"
-            "2. For each person on the list, run the refresh "
-            "(equivalent to refresh_person_summary):\n"
-            "   a. `get_person_full_context(slug=<their slug>)`\n"
-            "   b. Synthesize a 2-4 paragraph summary as described in "
-            "refresh_person_summary's docs.\n"
-            "   c. `update_person_summary(slug, new_summary)`\n"
-            "3. Report at the end: how many refreshed, with a one-line "
-            "before/after for each.\n"
+            "1. `list_drive_ingested()` — get last_crawl_at and ingested IDs.\n"
+            "2. Use Drive MCP to list recently-modified docs since the "
+            "boundary (parameter `since` if provided, else last_crawl_at, "
+            "else 7 days ago).\n"
+            "3. `get_ingest_context()` once.\n"
+            "4. For each doc, same flow as backfill_drive: skip if "
+            "already ingested, read content, analyze + record_doc + "
+            "mark_drive_ingested. Borderline cases → review queue.\n"
+            "5. Report what was processed."
+        )
+
+    # ---------- Proactive enrichment prompts ----------
+
+    @mcp.prompt(
+        description=(
+            "Find Drive/Linear material related to a concept and propose "
+            "ingesting it. Each candidate goes to the review queue."
+        ),
+    )
+    def enrich_concept(name: str) -> str:
+        return (
+            f"Proactively find material in Drive (and Linear if registered) "
+            f"that should enrich the '{name}' concept.\n"
             "\n"
-            "If the list has more than 5 people, ask me which to "
-            "prioritize — quality matters more than coverage here."
+            f"1. `get_concept_with_hierarchy(name='{name}')` and "
+            f"`get_concept_evidence(name='{name}')` — current scope.\n"
+            "2. If a Drive MCP is registered: search Drive (full-text, "
+            f"not just metadata) for content related to '{name}' and its "
+            "hierarchy keywords. Filter out things already in the vault "
+            "via `is_drive_ingested(drive_id)`.\n"
+            "3. If a Linear MCP is registered: search Linear for issues "
+            "tagged or mentioning the concept.\n"
+            "4. For each promising candidate, call `propose_review(\n"
+            "     kind='enrichment_ingest',\n"
+            f"     title='Ingest for {name}: <doc/issue title>',\n"
+            "     preview=<one-paragraph why this is relevant + a 200-char "
+            "excerpt>,\n"
+            "     proposed_action={'tool': 'ingest_drive_doc' or 'ingest_linear_issue', "
+            "'args': <enough metadata for the actual ingest>}\n"
+            "   )`.\n"
+            "5. Report: how many candidates queued, with IDs.\n"
+            "\n"
+            "Conservative bias — only propose if the candidate would "
+            "obviously enrich the concept. Don't pad."
         )
 
     @mcp.prompt(
         description=(
-            "Compile or refresh concept articles — finds concepts that "
-            "appear in 3+ sources and writes synthesis articles in "
-            "/wiki/concepts/."
+            "Find Drive/Linear material related to a thread and propose "
+            "ingesting it. Each candidate goes to the review queue."
         ),
     )
-    def compile_concepts(min_sources: int = 3, force: bool = False) -> str:
-        force_flag = ", regardless of whether they already have articles" if force else ""
+    def enrich_thread(slug: str) -> str:
         return (
-            f"Compile concept articles for concepts that appear in "
-            f"{min_sources}+ sources{force_flag}. Steps:\n"
+            f"Proactively find Drive/Linear material that should enrich "
+            f"the '{slug}' thread.\n"
             "\n"
-            f"1. Call `list_concept_candidates(min_sources={min_sources})`.\n"
-            "2. For each candidate (skip those with `has_article=true` "
-            "unless I asked you to force-refresh):\n"
-            "   a. `get_concept_evidence(name=<concept>)` — returns "
-            "every source that tags this concept with full content.\n"
-            "   b. Write a synthesis article (~400-700 words) "
-            "structured as:\n"
-            "      - Definition (1 paragraph)\n"
-            "      - How different sources approach this — agreements, "
-            "tensions, contradictions across the corpus\n"
-            "      - Synthesis: a unified understanding given all the "
-            "evidence\n"
-            "      - Open questions / where the concept is still evolving\n"
-            "      - Related concepts (if any [[wiki-links]] make sense)\n"
-            "      - Contributing sources (list of [[<source-slug>]])\n"
-            "   c. `record_concept_article(name=<concept>, "
-            "content=<article>)`\n"
-            "3. Report: how many articles created, how many skipped "
-            "(already exist), top recurring themes you noticed across "
-            "concepts.\n"
-            "\n"
-            "Concept articles should feel like the synthesis of an "
-            "analyst who's read everything in the vault on this topic, "
-            "not a stitching-together of source quotes."
+            f"1. `get_thread_full_context(slug='{slug}')` — current scope.\n"
+            "2. Use the thread thesis + recent evidence as a search query "
+            "against Drive (and Linear if registered). Skip already-"
+            "ingested docs.\n"
+            "3. For each candidate, propose_review with kind="
+            "'enrichment_ingest', title naming the thread, preview "
+            "explaining the relevance.\n"
+            "4. Report queued reviews."
         )
 
     @mcp.prompt(
         description=(
-            "Generate a weekly digest of vault activity — sources, "
-            "action items, threads advanced, top people. Defaults to "
-            "the current ISO week."
+            "Find Drive/Linear material related to a person and propose "
+            "ingesting it. Each candidate goes to the review queue."
         ),
     )
-    def digest_week(period_str: str = "this-week") -> str:
+    def enrich_person(name: str) -> str:
         return (
-            f"Generate a weekly digest for {period_str}. Steps:\n"
+            f"Proactively find Drive/Linear material involving {name}.\n"
             "\n"
-            "1. Resolve the period_str. If it's 'this-week' or empty, "
-            "use the current ISO week as 'YYYY-Www'. Otherwise expect "
-            "the format 'YYYY-Www' (ISO 8601).\n"
-            "2. Call `get_digest_context(period='week', "
-            "period_str=<resolved>)` for the underlying data.\n"
-            "3. Write a digest (~300-500 words):\n"
-            "   - Opening: one paragraph capturing the week's shape.\n"
-            "   - Top themes: 3-5 bullets, each a short paragraph "
-            "synthesizing a thread or recurring topic, citing the "
-            "sources that touched it.\n"
-            "   - People: who was most active, any new entries to the "
-            "vault.\n"
-            "   - Open at week's end: what's still on my list, what "
-            "I'm waiting on.\n"
-            "   - One-line reflection: what to carry into next week.\n"
-            "4. Call `record_digest(period='week', period_str=<resolved>, "
-            "content=<your digest>)` to persist.\n"
-            "5. Show me the digest in chat as well as filing it.\n"
-            "\n"
-            "Synthesis over enumeration — don't list every source, "
-            "highlight the ones that mattered."
+            f"1. `get_person_full_context(slug='{name}')`.\n"
+            "2. Search Drive for docs they authored, were shared with, "
+            "or are mentioned in. Use their email + name + aliases.\n"
+            "3. Search Linear for issues they own / are assigned / "
+            "mentioned in.\n"
+            "4. For each new candidate, propose_review with kind="
+            "'enrichment_ingest'.\n"
+            "5. Report queued reviews."
         )
+
+    # ---------- Review queue interaction prompt ----------
 
     @mcp.prompt(
         description=(
-            "Generate a monthly digest. Defaults to the current month."
+            "Walk through pending review items — show each, let me approve "
+            "or reject in chat."
         ),
     )
-    def digest_month(period_str: str = "this-month") -> str:
+    def review_pending() -> str:
         return (
-            f"Generate a monthly digest for {period_str}. Steps:\n"
+            "Walk me through pending reviews:\n"
             "\n"
-            "1. Resolve period_str — 'this-month' / empty → current "
-            "month as 'YYYY-MM'. Otherwise expect 'YYYY-MM'.\n"
-            "2. `get_digest_context(period='month', period_str=...)`.\n"
-            "3. Write a longer digest than weekly (~600-1000 words):\n"
-            "   - Month in one paragraph.\n"
-            "   - Threads that advanced significantly — for each, a "
-            "paragraph on what changed and where it stands now.\n"
-            "   - People dynamics — who came up most, new relationships, "
-            "shifting patterns.\n"
-            "   - Action items: what closed, what's still open and aging.\n"
-            "   - Pattern observations — anything you notice across the "
-            "month that wasn't obvious in any single week.\n"
-            "4. `record_digest(period='month', ...)` to persist.\n"
-            "5. Show in chat.\n"
+            "1. `list_pending_reviews()`.\n"
+            "2. Group by kind. For each kind, show the count.\n"
+            "3. For each item: show its title, id, and preview. Ask "
+            "approve/reject/skip.\n"
+            "4. On approve: call `approve_review(id)` — the proposed "
+            "action executes.\n"
+            "5. On reject: call `reject_review(id, reason=<my reason>)`.\n"
+            "6. On skip: leave it queued, move to next.\n"
+            "7. At the end, summarize: how many approved, rejected, "
+            "still pending.\n"
             "\n"
-            "If the month had < 5 sources, say so and offer a smaller "
-            "digest rather than padding."
+            "Show me ONE item at a time unless I tell you to batch."
         )
 
     @mcp.prompt(
         description=(
             "Catch me up — brief on what's changed in the vault: open "
-            "items, new people, recent sources."
+            "items, new people, recent sources, pending reviews."
         ),
     )
     def catch_me_up() -> str:
@@ -1956,6 +2423,333 @@ present in the source, omit or pass [] for anything that isn't):
 
 
 # ---------- helpers ----------
+
+
+def _entity_sources(state, slug: str, config: Config) -> set:
+    """Return the set of source slugs associated with any entity slug.
+
+    Source: just {slug} itself. Person: their appearances. Thread:
+    sources in evidence. Concept: sources tagging it.
+    """
+    if slug in state.sources:
+        return {slug}
+    if slug in state.people:
+        return set(state.people[slug].appearances)
+    if slug in state.global_threads:
+        thread_path = config.wiki_threads / f"{slug}.md"
+        if thread_path.exists():
+            from deep_reader.thread_utils import extract_section
+            import re as _re
+            evidence = extract_section(thread_path.read_text(), "Evidence")
+            return {m.group(1) for m in _re.finditer(r"\[\[([^\]/]+)/chunk-\d+\]\]", evidence)}
+    if slug in state.concepts or slug.lower() in state.concepts:
+        slug_l = slug.lower() if slug.lower() in state.concepts else slug
+        import re as _re
+        out: set = set()
+        for src_slug in state.sources:
+            src_dir = config.wiki_sources / src_slug
+            for cp in src_dir.glob("chunk-*.md"):
+                if _re.search(r"\[\[" + _re.escape(slug_l) + r"\]\]", cp.read_text(), _re.IGNORECASE):
+                    out.add(src_slug)
+                    break
+        return out
+    # Try as person name
+    for p in state.people.values():
+        if p.name.lower() == slug.lower():
+            return set(p.appearances)
+    return set()
+
+
+def _related_for_source(state, slug: str, limit: int) -> dict:
+    """Co-attendees, threads advanced, concepts tagged."""
+    src = state.sources[slug]
+    co_attendees = []
+    for p in state.people.values():
+        if slug in p.appearances:
+            co_attendees.append({"slug": p.slug, "name": p.name})
+    return {
+        "kind": "source",
+        "slug": slug,
+        "co_attendees": co_attendees[:limit],
+        "threads_in_source": list(src.threads)[:limit],
+    }
+
+
+def _related_for_person(state, slug: str, limit: int) -> dict:
+    """Sources, threads, frequent co-appearances."""
+    p = state.people[slug]
+    # Co-appearance ranking: how many sources do other people share
+    co_app: dict = {}
+    p_set = set(p.appearances)
+    for other in state.people.values():
+        if other.slug == slug:
+            continue
+        shared = len(p_set & set(other.appearances))
+        if shared:
+            co_app[other.slug] = {"slug": other.slug, "name": other.name, "shared": shared}
+    co_app_sorted = sorted(co_app.values(), key=lambda x: x["shared"], reverse=True)
+    return {
+        "kind": "person",
+        "slug": slug,
+        "name": p.name,
+        "appearances": p.appearances[-limit:],
+        "frequent_co_appearances": co_app_sorted[:limit],
+    }
+
+
+def _related_for_thread(state, slug: str, config: Config, limit: int) -> dict:
+    """Contributing sources, central people, related threads."""
+    thread_path = config.wiki_threads / f"{slug}.md"
+    contributing: list = []
+    if thread_path.exists():
+        from deep_reader.thread_utils import extract_section
+        import re as _re
+        evidence = extract_section(thread_path.read_text(), "Evidence")
+        seen: set = set()
+        for m in _re.finditer(r"\[\[([^\]/]+)/chunk-\d+\]\]", evidence):
+            if m.group(1) not in seen:
+                seen.add(m.group(1))
+                contributing.append(m.group(1))
+    contrib_set = set(contributing)
+    # Central people (most appearances in contributing)
+    people_overlap = []
+    for p in state.people.values():
+        c = len(set(p.appearances) & contrib_set)
+        if c:
+            people_overlap.append({"slug": p.slug, "name": p.name, "in_count": c})
+    people_overlap.sort(key=lambda x: x["in_count"], reverse=True)
+    # Related threads: other threads sharing 2+ sources
+    related_threads = []
+    for other_slug in state.global_threads:
+        if other_slug == slug:
+            continue
+        other_path = config.wiki_threads / f"{other_slug}.md"
+        if not other_path.exists():
+            continue
+        from deep_reader.thread_utils import extract_section
+        import re as _re
+        other_ev = extract_section(other_path.read_text(), "Evidence")
+        other_set = {m.group(1) for m in _re.finditer(r"\[\[([^\]/]+)/chunk-\d+\]\]", other_ev)}
+        shared = len(contrib_set & other_set)
+        if shared >= 2:
+            related_threads.append({"slug": other_slug, "shared_sources": shared})
+    related_threads.sort(key=lambda x: x["shared_sources"], reverse=True)
+    return {
+        "kind": "thread",
+        "slug": slug,
+        "contributing_sources": contributing[:limit],
+        "central_people": people_overlap[:limit],
+        "related_threads": related_threads[:limit],
+    }
+
+
+def _related_for_concept(state, slug: str, config: Config, limit: int) -> dict:
+    """Contributing sources + hierarchy + central people."""
+    c = state.concepts.get(slug)
+    if not c:
+        return {"error": f"concept '{slug}' not found"}
+    # Contributing sources via concept tags
+    import re as _re
+    contributing: list = []
+    for src_slug in state.sources:
+        src_dir = config.wiki_sources / src_slug
+        for cp in src_dir.glob("chunk-*.md"):
+            if _re.search(r"\[\[" + _re.escape(slug) + r"\]\]", cp.read_text(), _re.IGNORECASE):
+                contributing.append(src_slug)
+                break
+    contrib_set = set(contributing)
+    # Central people
+    people_overlap = []
+    for p in state.people.values():
+        cnt = len(set(p.appearances) & contrib_set)
+        if cnt:
+            people_overlap.append({"slug": p.slug, "name": p.name, "in_count": cnt})
+    people_overlap.sort(key=lambda x: x["in_count"], reverse=True)
+    return {
+        "kind": "concept",
+        "slug": slug,
+        "name": c.name,
+        "parents": list(c.parent_concepts),
+        "children": list(c.child_concepts),
+        "related": list(c.related_concepts),
+        "contributing_sources": contributing[:limit],
+        "central_people": people_overlap[:limit],
+    }
+
+
+def _dump_review(r, full: bool = False) -> dict:
+    out = {
+        "id": r.id,
+        "kind": r.kind,
+        "title": r.title,
+        "status": r.status,
+        "created_at": r.created_at.isoformat(),
+    }
+    if r.reviewed_at:
+        out["reviewed_at"] = r.reviewed_at.isoformat()
+    if full:
+        out["preview"] = r.preview
+        out["proposed_action"] = r.proposed_action
+    return out
+
+
+def _render_review_pending(config: Config, state) -> None:
+    """Render /wiki/_review/pending.md from current review_queue state."""
+    review_dir = config.vault_root / "wiki" / "_review"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    path = review_dir / "pending.md"
+
+    pending = [r for r in state.review_queue if r.status == "pending"]
+    pending.sort(key=lambda r: r.created_at, reverse=True)
+
+    lines = ["# Pending Reviews\n"]
+    if not pending:
+        lines.append(
+            "_(nothing to review right now)_\n\n"
+            "When the system has Claude-proposed actions waiting for your "
+            "approval (concept page refreshes, hierarchy suggestions, Drive "
+            "ingest candidates), they'll show up here.\n"
+        )
+    else:
+        lines.append(
+            f"_{len(pending)} item{'s' if len(pending) != 1 else ''} waiting "
+            "for your decision. To approve / reject in chat, say:_\n"
+            "- *approve <id>* / *reject <id>*\n"
+            "- *approve all concept refreshes* / *reject all drive borderline*\n\n"
+        )
+
+        # Group by kind
+        from collections import defaultdict
+        by_kind: dict[str, list] = defaultdict(list)
+        for r in pending:
+            by_kind[r.kind].append(r)
+
+        for kind, items in by_kind.items():
+            lines.append(f"## {kind} ({len(items)})\n")
+            for r in items:
+                lines.append(f"### {r.title}")
+                lines.append(f"_id: `{r.id}` · created {r.created_at.date().isoformat()}_\n")
+                lines.append(r.preview)
+                lines.append("")
+
+    path.write_text("\n".join(lines))
+
+
+# Dispatch table for executing review-queue proposed actions.
+# Maps tool_name → callable that takes (config, args) and returns a result dict.
+# Populated lazily inside _dispatch_review_action so we don't need to import
+# every dependency at module load time.
+def _dispatch_review_action(config: Config, tool_name: str, args: dict) -> dict:
+    """Dispatch a proposed-action to the named tool. Used by approve_review."""
+    if not tool_name:
+        return {"error": "proposed_action missing 'tool' field"}
+
+    # Build server fresh to access tools — heavy but only on approval.
+    # Long-running approve is fine since user is reviewing in chat.
+    if tool_name == "record_concept_page":
+        from deep_reader.state import GlobalState
+        state = GlobalState.load(config.state_file)
+        return _do_record_concept_page(config, state, **args)
+    if tool_name == "link_concepts":
+        from deep_reader.state import GlobalState
+        state = GlobalState.load(config.state_file)
+        return _do_link_concepts(config, state, **args)
+    if tool_name == "ingest_drive_doc":
+        # The actual record_doc tool is on the MCP server. We could call
+        # it via the server's call_tool API, but here we'll just record
+        # the metadata and let Claude follow up with the real ingest.
+        return {
+            "note": (
+                "ingest_drive_doc approved. Claude should now call "
+                "record_doc with the structured analysis it prepared."
+            ),
+            "args": args,
+        }
+    return {"error": f"no dispatch handler for tool '{tool_name}'"}
+
+
+def _do_record_concept_page(config: Config, state, **kwargs) -> dict:
+    """Concrete handler for record_concept_page. Used by approve_review and
+    callable directly from the tool of the same name."""
+    from deep_reader.markdown import format_frontmatter
+    from deep_reader.state import Concept
+
+    name = kwargs.get("name", "").strip()
+    if not name:
+        return {"error": "name required"}
+    slug = name.lower().replace(" ", "-")
+    definition = (kwargs.get("definition") or "").strip()
+    distillation = (kwargs.get("distillation") or "").strip()
+    tensions = (kwargs.get("tensions") or "").strip()
+    contributing = kwargs.get("contributing_sources") or []
+    parent_concepts = kwargs.get("parent_concepts") or []
+    child_concepts = kwargs.get("child_concepts") or []
+    related_concepts = kwargs.get("related_concepts") or []
+
+    # Update Concept state record
+    if slug not in state.concepts:
+        state.concepts[slug] = Concept(slug=slug, name=name)
+    concept = state.concepts[slug]
+    concept.parent_concepts = list(set(concept.parent_concepts + parent_concepts))
+    concept.child_concepts = list(set(concept.child_concepts + child_concepts))
+    concept.related_concepts = list(set(concept.related_concepts + related_concepts))
+    concept.last_refreshed = datetime.now()
+    concept.sources_at_last_refresh = len(contributing)
+    state.save(config.state_file)
+
+    # Render the page
+    fm = {"name": name, "slug": slug, "type": "concept", "last_refreshed": datetime.now().date().isoformat()}
+    parts = [format_frontmatter(fm), f"# {name}\n"]
+    if definition:
+        parts.append(f"## Definition\n{definition}\n")
+    if parent_concepts or child_concepts or related_concepts:
+        h_lines = ["## Hierarchy"]
+        if parent_concepts:
+            h_lines.append("**Parents:** " + ", ".join(f"[[concepts/{c}|{c}]]" for c in parent_concepts))
+        if child_concepts:
+            h_lines.append("**Children:** " + ", ".join(f"[[concepts/{c}|{c}]]" for c in child_concepts))
+        if related_concepts:
+            h_lines.append("**Related:** " + ", ".join(f"[[concepts/{c}|{c}]]" for c in related_concepts))
+        parts.append("\n".join(h_lines) + "\n")
+    if distillation:
+        parts.append(f"## Distillation\n{distillation}\n")
+    if tensions:
+        parts.append(f"## Tensions / open questions\n{tensions}\n")
+    if contributing:
+        contrib_lines = ["## Contributing sources"]
+        for slug_ in contributing:
+            contrib_lines.append(f"- [[sources/{slug_}/_overview|{slug_}]]")
+        parts.append("\n".join(contrib_lines) + "\n")
+
+    path = config.wiki_concepts / f"{slug}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(parts))
+    return {"name": name, "slug": slug, "path": str(path.relative_to(config.vault_root))}
+
+
+def _do_link_concepts(config: Config, state, parent: str, child: str, kind: str = "parent") -> dict:
+    """Establish a hierarchy relationship between two concepts."""
+    from deep_reader.state import Concept
+    parent_slug = parent.strip().lower().replace(" ", "-")
+    child_slug = child.strip().lower().replace(" ", "-")
+    if parent_slug not in state.concepts:
+        state.concepts[parent_slug] = Concept(slug=parent_slug, name=parent)
+    if child_slug not in state.concepts:
+        state.concepts[child_slug] = Concept(slug=child_slug, name=child)
+    p = state.concepts[parent_slug]
+    c = state.concepts[child_slug]
+    if kind == "parent":
+        if child_slug not in p.child_concepts:
+            p.child_concepts.append(child_slug)
+        if parent_slug not in c.parent_concepts:
+            c.parent_concepts.append(parent_slug)
+    elif kind == "related":
+        if child_slug not in p.related_concepts:
+            p.related_concepts.append(child_slug)
+        if parent_slug not in c.related_concepts:
+            c.related_concepts.append(parent_slug)
+    state.save(config.state_file)
+    return {"parent": parent_slug, "child": child_slug, "kind": kind, "linked": True}
 
 
 def _rerender_after_action_change(config: Config, state, item) -> None:
